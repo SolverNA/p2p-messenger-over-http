@@ -19,7 +19,8 @@ async function launch(name,extra=[]){
  const port=await freePort();let logs='';
  const legacy=name==='hub'&&process.env.P2P_LEGACY_HUB==='1';
  const mode=legacy?['--ui',`127.0.0.1:${await freePort()}`]:['--headless'];
- const p=spawn(legacy?join(process.cwd(),'messenger'):binary,['--data',join(dir,name),...mode,'--port',String(port),'--direct-port','0',...extra],{env:{...process.env,SSL_CERT_FILE:join(dir,'cert.pem')}});children.push(p);p.stderr.on('data',b=>logs+=b);p.stdout.on('data',b=>logs+=b);
+ const family=process.env.P2P_IP6==='1'?['--ip-family','6']:[];
+ const p=spawn(legacy?join(process.cwd(),'messenger'):binary,['--data',join(dir,name),...mode,...family,'--port',String(port),'--direct-port','0',...extra],{env:{...process.env,SSL_CERT_FILE:join(dir,'cert.pem')}});children.push(p);p.stderr.on('data',b=>logs+=b);p.stdout.on('data',b=>logs+=b);
  const initial=await until(async()=>{if(p.exitCode!==null)throw Error(logs);if(legacy){const m=logs.match(/Peer ID: (\S+)/);return m?{state:{peer:m[1]}}:null}return control(name)});
  assert.equal(statSync(join(dir,name)).mode&0o777,0o700);
  if(!legacy)assert.equal(statSync(join(dir,name,'control.sock')).mode&0o777,0o600);
@@ -28,10 +29,15 @@ async function launch(name,extra=[]){
 try{
  execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(dir,'tls.key'),'-out',join(dir,'cert.pem'),'-days','1','-subj','/CN=localhost','-addext','subjectAltName=DNS:localhost'],{stdio:'ignore'});
  const hub=await launch('hub',['--reachability','public','--tls-cert',join(dir,'cert.pem'),'--tls-key',join(dir,'tls.key')]);
- const bootstrap=`/dns4/localhost/tcp/${hub.port}/tls/ws/p2p/${hub.status.peer}`;
+ const bootstrap=`/${process.env.P2P_IP6==='1'?'dns6':'dns4'}/localhost/tcp/${hub.port}/tls/ws/p2p/${hub.status.peer}`;
  const a=await launch('alice',['--reachability','private','--bootstrap',bootstrap]);
  let b=await launch('bob',['--reachability','private','--bootstrap',bootstrap]);
  await until(async()=>(await control('alice')).state.connections.some(c=>c.peer===hub.status.peer));
+ if(process.env.P2P_IP6==='1'){
+  const s=(await control('alice')).state;
+  assert(s.connections.filter(c=>c.peer===hub.status.peer).every(c=>c.address.startsWith('/ip6/')),'connection fell back to IPv4');
+  assert(!s.addresses.some(a=>a.startsWith('/ip4/')),'IPv4 listener advertised in IPv6 mode');
+ }
  const cliStatus=JSON.parse(execFileSync(binary,['--data',join(dir,'alice'),'--status'],{encoding:'utf8'}));assert.equal(cliStatus.peer,a.status.peer);
  const messageID=execFileSync(binary,['--data',join(dir,'alice'),'--send',b.status.peer,'--message','Привет из CLI!'],{encoding:'utf8'}).trim();assert.match(messageID,/^[a-f0-9]{32}$/);
  await until(async()=>(await control('alice')).state.messages.some(e=>e.status==='delivered'));
@@ -46,6 +52,6 @@ try{
  b=await launch('bob');assert.equal(b.status.peer,peer);assert.notEqual(b.port,oldPort);
  await until(async()=>(await control('alice')).state.messages.filter(e=>e.status==='delivered').length===2,60000);
  assert.equal((await control('bob')).state.messages.length,2);
- console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline status/retry, persisted config/keys/outbox, recovery on new address.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':''));
+ console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline status/retry, persisted config/keys/outbox, recovery on new address.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':'')+(process.env.P2P_IP6==='1'?' IPv6 transport confirmed.':''));
 }catch(e){for(const p of children){if(p.exitCode===null)p.kill('SIGTERM')}throw e}
 finally{await Promise.all(children.filter(p=>p.exitCode===null).map(p=>new Promise(r=>{p.once('exit',r);p.kill('SIGTERM')})));rmSync(dir,{recursive:true,force:true})}

@@ -921,6 +921,33 @@ type Config struct {
 	Reachability string `json:"reachability"`
 	TLSCert      string `json:"tls_cert"`
 	TLSKey       string `json:"tls_key"`
+	IPFamily     string `json:"ip_family"`
+}
+
+func listenAddresses(c Config, suffix string) ([]string, error) {
+	family := c.IPFamily
+	if family == "" {
+		family = "auto"
+	}
+	var bases []string
+	switch family {
+	case "auto":
+		bases = []string{"/ip4/0.0.0.0", "/ip6/::"}
+	case "4":
+		bases = []string{"/ip4/0.0.0.0"}
+	case "6":
+		bases = []string{"/ip6/::"}
+	default:
+		return nil, errors.New("--ip-family must be auto, 4 or 6")
+	}
+	var addrs []string
+	for _, base := range bases {
+		addrs = append(addrs, fmt.Sprintf("%s/tcp/%d/%s", base, c.Port, suffix))
+		if c.DirectPort > 0 {
+			addrs = append(addrs, fmt.Sprintf("%s/tcp/%d", base, c.DirectPort), fmt.Sprintf("%s/udp/%d/quic-v1", base, c.DirectPort))
+		}
+	}
+	return addrs, nil
 }
 
 func defaultData() string {
@@ -934,7 +961,7 @@ func defaultData() string {
 	return filepath.Join(home, ".local", "share", "p2pmessenger")
 }
 func savedConfig(dir string, explicit Config, visited map[string]bool) (Config, error) {
-	cfg := Config{Port: 8081, DirectPort: 4002, Reachability: "auto"}
+	cfg := Config{Port: 8081, DirectPort: 4002, Reachability: "auto", IPFamily: "auto"}
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err == nil {
 		if err = json.Unmarshal(raw, &cfg); err != nil {
@@ -959,6 +986,8 @@ func savedConfig(dir string, explicit Config, visited map[string]bool) (Config, 
 			cfg.TLSCert = explicit.TLSCert
 		case "tls-key":
 			cfg.TLSKey = explicit.TLSKey
+		case "ip-family":
+			cfg.IPFamily = explicit.IPFamily
 		}
 	}
 	return cfg, nil
@@ -1285,6 +1314,7 @@ func run() error {
 	flag.StringVar(&cfg.Reachability, "reachability", "auto", "auto, public, private")
 	flag.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM TLS certificate chain")
 	flag.StringVar(&cfg.TLSKey, "tls-key", "", "PEM TLS private key")
+	flag.StringVar(&cfg.IPFamily, "ip-family", "auto", "listener IP family: auto (IPv4 + IPv6), 4 or 6")
 	flag.Parse()
 	if flag.NArg() > 0 {
 		return errors.New("unexpected positional arguments; use one line without backslashes, or put each backslash at the end of a line")
@@ -1421,10 +1451,12 @@ func run() error {
 		wsargs[i] = opt
 	}
 	opts := []libp2p.Option{libp2p.Identity(identity), libp2p.NoTransports, libp2p.Transport(websocket.New, wsargs...), libp2p.Security(noise.ID, noise.New), libp2p.EnableRelay(), libp2p.EnableRelayService(), libp2p.EnableNATService(), libp2p.EnableHolePunching(), libp2p.NATPortMap(), libp2p.UserAgent("p2pmessenger/0.1")}
-	listens := []string{fmt.Sprintf("/ip4/0.0.0.0/tcp/%d/%s", *port, suffix)}
+	listens, e := listenAddresses(cfg, suffix)
+	if e != nil {
+		return e
+	}
 	if *directPort > 0 {
 		opts = append(opts, libp2p.Transport(tcp.NewTCPTransport), libp2p.Transport(quic.NewTransport))
-		listens = append(listens, fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", *directPort), fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", *directPort))
 	}
 	opts = append(opts, libp2p.ListenAddrStrings(listens...))
 	if len(advertised) > 0 {
