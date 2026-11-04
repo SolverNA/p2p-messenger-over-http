@@ -1,0 +1,8 @@
+/messenger
+/messenger.exe
+/node-data/
+/public-node/
+/alice/
+/bob/
+*.key
+*.pem
