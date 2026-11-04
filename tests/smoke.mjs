@@ -1,28 +1,29 @@
-// End-to-end check of the actual executable, including trusted TLS and restart.
-// Run: go build -o messenger . && node tests/smoke.mjs
+// End-to-end check: built daemon, WSS, CLI, persisted config and offline recovery.
+// Run: go build -o messenger-tui . && node tests/smoke.mjs
 import {spawn,execFileSync} from 'node:child_process';
-import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,readFileSync,rmSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import net from 'node:net';
-import http from 'node:http';
 import assert from 'node:assert/strict';
-import vm from 'node:vm';
-const dir=mkdtempSync(join(tmpdir(),'p2pmessenger-'));
+const dir=mkdtempSync(join(tmpdir(),'p2pmessenger-')),binary=join(process.cwd(),'messenger-tui');
 const children=[];
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function freePort(){const s=net.createServer();await new Promise(r=>s.listen(0,'127.0.0.1',r));const p=s.address().port;await new Promise(r=>s.close(r));return p}
+// Stay outside Linux's usual ephemeral client-port range: an outbound libp2p
+// connection could otherwise claim a just-probed port before the child binds.
+const usedPorts=new Set();
+async function freePort(){for(let i=0;i<100;i++){const p=20000+Math.floor(Math.random()*10000);if(usedPorts.has(p))continue;const s=net.createServer();try{await new Promise((resolve,reject)=>{s.once('error',reject);s.listen(p,'0.0.0.0',resolve)})}catch(e){if(e.code==='EADDRINUSE')continue;throw e}await new Promise(r=>s.close(r));usedPorts.add(p);return p}throw Error('no free test port')}
 async function until(fn,ms=30000){const end=Date.now()+ms;let last;while(Date.now()<end){try{const v=await fn();if(v)return v}catch(e){last=e}await sleep(200)}throw last||Error('timed out')}
+function control(name,q={op:'snapshot'}){return new Promise((resolve,reject)=>{const c=net.createConnection(join(dir,name,'control.sock'));let data='';c.setTimeout(7000);c.on('connect',()=>c.write(JSON.stringify(q)+'\n'));c.on('data',b=>data+=b);c.on('error',reject);c.on('timeout',()=>{c.destroy();reject(Error('local control timeout'))});c.on('end',()=>{try{const r=JSON.parse(data);if(r.error)throw Error(r.error);resolve(r)}catch(e){reject(e)}})})}
 async function launch(name,extra=[]){
- const ui=await freePort(),port=await freePort();let logs='';
- const p=spawn(join(process.cwd(),'messenger'),['--data',join(dir,name),'--ui',`127.0.0.1:${ui}`,'--port',String(port),'--direct-port','0',...extra],{env:{...process.env,SSL_CERT_FILE:join(dir,'cert.pem')}});children.push(p);p.stderr.on('data',b=>logs+=b);p.stdout.on('data',b=>logs+=b);
- const base=`http://127.0.0.1:${ui}`;
- const html=await until(async()=>{if(p.exitCode!==null)throw Error(logs);const r=await fetch(base);if(r.ok)return r.text()});
- new vm.Script(html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1]);
- const token=html.match(/const token='([^']+)'/)[1];
- async function api(path,body){const r=await fetch(base+path,{method:body?'POST':'GET',headers:{'X-Node-Token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(await r.text());return r.json()}
- const status=await api('/api/status');
- return {p,base,api,status,port,logs:()=>logs,async stop(){if(p.exitCode!==null)return;const done=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');await done}};
+ const port=await freePort();let logs='';
+ const legacy=name==='hub'&&process.env.P2P_LEGACY_HUB==='1';
+ const mode=legacy?['--ui',`127.0.0.1:${await freePort()}`]:['--headless'];
+ const p=spawn(legacy?join(process.cwd(),'messenger'):binary,['--data',join(dir,name),...mode,'--port',String(port),'--direct-port','0',...extra],{env:{...process.env,SSL_CERT_FILE:join(dir,'cert.pem')}});children.push(p);p.stderr.on('data',b=>logs+=b);p.stdout.on('data',b=>logs+=b);
+ const initial=await until(async()=>{if(p.exitCode!==null)throw Error(logs);if(legacy){const m=logs.match(/Peer ID: (\S+)/);return m?{state:{peer:m[1]}}:null}return control(name)});
+ assert.equal(statSync(join(dir,name)).mode&0o777,0o700);
+ if(!legacy)assert.equal(statSync(join(dir,name,'control.sock')).mode&0o777,0o600);
+ return {p,name,status:initial.state,port,logs:()=>logs,async stop(){if(p.exitCode!==null)return;const done=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');await done}};
 }
 try{
  execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(dir,'tls.key'),'-out',join(dir,'cert.pem'),'-days','1','-subj','/CN=localhost','-addext','subjectAltName=DNS:localhost'],{stdio:'ignore'});
@@ -30,25 +31,21 @@ try{
  const bootstrap=`/dns4/localhost/tcp/${hub.port}/tls/ws/p2p/${hub.status.peer}`;
  const a=await launch('alice',['--reachability','private','--bootstrap',bootstrap]);
  let b=await launch('bob',['--reachability','private','--bootstrap',bootstrap]);
- await until(async()=>{const s=await a.api('/api/status');return s.connections.some(c=>c.peer===hub.status.peer)});
- assert.equal((await fetch(a.base+'/api/status')).status,403,'API must require token');
- assert.equal((await fetch(a.base+'/api/send',{method:'POST',headers:{'X-Node-Token':'invalid'}})).status,403);
- const hostileHostStatus=await new Promise((resolve,reject)=>{const req=http.get(a.base,{headers:{Host:'attacker.invalid'}},res=>{res.resume();resolve(res.statusCode)});req.on('error',reject)});
- assert.equal(hostileHostStatus,403,'reject DNS rebinding');
- assert.equal((await fetch(a.base+'/api/status',{headers:{'X-Node-Token':(await (await fetch(a.base)).text()).match(/const token='([^']+)'/)[1],Origin:'https://attacker.invalid'}})).status,403);
- await a.api('/api/send',{to:b.status.peer,text:'Первое сообщение через сеть с WSS-узлом'});
- await until(async()=>(await a.api('/api/messages')).some(e=>e.status==='delivered'));
- assert.equal((await b.api('/api/messages')).length,1);
+ await until(async()=>(await control('alice')).state.connections.some(c=>c.peer===hub.status.peer));
+ const cliStatus=JSON.parse(execFileSync(binary,['--data',join(dir,'alice'),'--status'],{encoding:'utf8'}));assert.equal(cliStatus.peer,a.status.peer);
+ const messageID=execFileSync(binary,['--data',join(dir,'alice'),'--send',b.status.peer,'--message','Привет из CLI!'],{encoding:'utf8'}).trim();assert.match(messageID,/^[a-f0-9]{32}$/);
+ await until(async()=>(await control('alice')).state.messages.some(e=>e.status==='delivered'));
+ assert.equal((await control('bob')).state.messages.length,1);
  const peer=b.status.peer,oldPort=b.port;await b.stop();
- await a.api('/api/send',{to:peer,text:'Доставка после смены адреса'});
- await sleep(600);
- await a.stop(); // Outbox must survive a sender restart, too.
- const a2=await launch('alice',['--reachability','private','--bootstrap',bootstrap]);
- assert.equal(a2.status.peer,a.status.peer,'sender identity changed');
- b=await launch('bob',['--reachability','private','--bootstrap',bootstrap]);
- assert.equal(b.status.peer,peer,'recipient identity changed');assert.notEqual(b.port,oldPort);
- await until(async()=>(await a2.api('/api/messages')).filter(e=>e.status==='delivered').length===2,60000);
- assert.equal((await b.api('/api/messages')).length,2,'message lost or duplicated after restart');
- console.log('PASS: HTTPS/WSS bootstrap, API protection, UI script syntax, delivery, persistent identities/outbox, restart on new address.');
+ await control('alice',{op:'send',to:peer,text:'Доставка после смены адреса'});
+ await until(async()=>{const s=(await control('alice')).state,d=s.peers[peer];return d&&['unavailable','connect_failed','delivery_failed'].includes(d.status)&&d.next_attempt>Date.now()},30000);
+ await a.stop();
+ // Network flags intentionally omitted: bootstrap and mode must load from config.
+ const a2=await launch('alice');assert.equal(a2.status.peer,a.status.peer);
+ const saved=JSON.parse(readFileSync(join(dir,'alice','config.json'),'utf8'));assert.equal(saved.bootstrap,bootstrap);assert.equal(saved.reachability,'private');
+ b=await launch('bob');assert.equal(b.status.peer,peer);assert.notEqual(b.port,oldPort);
+ await until(async()=>(await control('alice')).state.messages.filter(e=>e.status==='delivered').length===2,60000);
+ assert.equal((await control('bob')).state.messages.length,2);
+ console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline status/retry, persisted config/keys/outbox, recovery on new address.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':''));
 }catch(e){for(const p of children){if(p.exitCode===null)p.kill('SIGTERM')}throw e}
 finally{await Promise.all(children.filter(p=>p.exitCode===null).map(p=>new Promise(r=>{p.once('exit',r);p.kill('SIGTERM')})));rmSync(dir,{recursive:true,force:true})}

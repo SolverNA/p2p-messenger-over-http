@@ -1,4 +1,4 @@
-// P2P messenger: a single source file with an embedded browser interface.
+// P2P messenger: a single source file with a terminal interface.
 package main
 
 import (
@@ -15,7 +15,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,7 +23,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/gofrs/flock"
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -41,6 +42,8 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/rivo/tview"
+	"golang.org/x/term"
 )
 
 const (
@@ -105,11 +108,11 @@ type Node struct {
 	mu       sync.Mutex
 	state    DiskState
 	routes   map[peer.ID]Route
+	delivery map[string]PeerDelivery
 	reach    network.Reachability
 	wake     chan struct{}
 	sendWake chan struct{}
 	sem      chan struct{}
-	token    string
 }
 
 func bytesOf(v any) []byte { b, _ := json.Marshal(v); return b }
@@ -188,7 +191,9 @@ func (n *Node) localRoute() (Route, error) {
 		seq = n.state.Sequence + 1
 	}
 	n.state.Sequence = seq
-	if err := n.saveLocked(); err != nil {
+	// Address refreshes should write a tiny counter, not rewrite the entire chat
+	// history every 30 seconds. Keep reading the old counter for compatibility.
+	if err := atomicWrite(filepath.Join(n.dir, "sequence.json"), bytesOf(seq)); err != nil {
 		return Route{}, err
 	}
 	pub, err := crypto.MarshalPublicKey(n.key.GetPublic())
@@ -503,14 +508,23 @@ func (n *Node) deliver(ctx context.Context, m Message) (result error) {
 	if err != nil {
 		return err
 	}
-	// A failed attempt must fetch a new registration instead of retrying a stale
-	// address until its TTL expires after a network change.
+	phase := "looking_up"
+	n.deliveryPhase(m.Body.To, phase)
 	defer func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		d := n.delivery[m.Body.To]
 		if result != nil {
-			n.mu.Lock()
+			// Refetch registration on retry, including after a network change.
 			delete(n.routes, id)
-			n.mu.Unlock()
+			d.Failures++
+			d.Status = map[string]string{"looking_up": "unavailable", "connecting": "connect_failed", "sending": "delivery_failed", "rejected": "rejected"}[phase]
+			d.Detail = result.Error()
+			d.NextAttempt = time.Now().Add(retryDelay(d.Failures)).UnixMilli()
+		} else {
+			d = PeerDelivery{Status: "connected"}
 		}
+		n.delivery[m.Body.To] = d
 	}()
 	// Refresh routing even when a stale direct address remains in the peerstore.
 	if len(n.h.Network().ConnsToPeer(id)) == 0 {
@@ -518,6 +532,8 @@ func (n *Node) deliver(ctx context.Context, m Message) (result error) {
 		if e != nil {
 			return e
 		}
+		phase = "connecting"
+		n.deliveryPhase(m.Body.To, phase)
 		ai, e := validateRoute(*r)
 		if e != nil {
 			return e
@@ -532,12 +548,22 @@ func (n *Node) deliver(ctx context.Context, m Message) (result error) {
 			}
 		}
 	}
+	phase = "connecting"
+	n.deliveryPhase(m.Body.To, phase)
 	s, err := n.h.NewStream(network.WithAllowLimitedConn(ctx, "encrypted chat through relay"), id, messageProtocol)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(10 * time.Second))
+	phase = "sending"
+	n.deliveryPhase(m.Body.To, phase)
+	deadline := time.Now().Add(10 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = s.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() { _ = s.Reset() })
+	defer stopCancel()
 	if err = json.NewEncoder(s).Encode(m); err != nil {
 		_ = s.Reset()
 		return err
@@ -551,12 +577,13 @@ func (n *Node) deliver(ctx context.Context, m Message) (result error) {
 		return errors.New("invalid acknowledgement")
 	}
 	if ack.Error != "" {
+		phase = "rejected"
 		return errors.New(ack.Error)
 	}
 	return nil
 }
 func (n *Node) sendLoop(ctx context.Context) {
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
 		select {
@@ -568,7 +595,7 @@ func (n *Node) sendLoop(ctx context.Context) {
 		n.mu.Lock()
 		var pending []Message
 		for _, e := range n.state.Messages {
-			if e.Status == "queued" {
+			if e.Status == "queued" && n.delivery[e.Message.Body.To].NextAttempt <= time.Now().UnixMilli() {
 				pending = append(pending, e.Message)
 			}
 		}
@@ -584,6 +611,7 @@ func (n *Node) sendLoop(ctx context.Context) {
 			select {
 			case slots <- struct{}{}:
 			case <-ctx.Done():
+				wg.Wait()
 				return
 			}
 			wg.Add(1)
@@ -605,9 +633,11 @@ func (n *Node) sendLoop(ctx context.Context) {
 							} else {
 								e.Error = err.Error()
 							}
-							if saveErr := n.saveLocked(); saveErr != nil {
-								*e = old
-								log.Print(saveErr)
+							if e.Status != old.Status || e.Error != old.Error {
+								if saveErr := n.saveLocked(); saveErr != nil {
+									*e = old
+									log.Print(saveErr)
+								}
 							}
 							break
 						}
@@ -726,133 +756,579 @@ func (n *Node) maintain(ctx context.Context) {
 	}
 }
 
-func jsonReply(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(v)
+// Local control uses a private Unix socket, not a browser or an HTTP API.
+type PeerDelivery struct {
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	Failures    int    `json:"failures,omitempty"`
+	NextAttempt int64  `json:"next_attempt,omitempty"`
 }
-func (n *Node) status() any {
+
+func retryDelay(failures int) time.Duration {
+	return min(time.Minute, 5*time.Second<<min(4, max(0, failures-1)))
+}
+func (n *Node) deliveryPhase(id, phase string) {
 	n.mu.Lock()
-	reach := n.reach.String()
-	queued := 0
-	for _, e := range n.state.Messages {
-		if e.Status == "queued" {
-			queued++
+	defer n.mu.Unlock()
+	if n.delivery == nil {
+		n.delivery = map[string]PeerDelivery{}
+	}
+	d := n.delivery[id]
+	d.Status = phase
+	d.NextAttempt = 0
+	n.delivery[id] = d
+}
+func peerDeliveryLabel(d PeerDelivery) string {
+	label := map[string]string{"looking_up": "ищем собеседника", "connecting": "подключаемся", "sending": "отправляем", "connected": "на связи", "unavailable": "не в сети / недоступен", "connect_failed": "не удалось подключиться", "delivery_failed": "сбой доставки", "rejected": "получатель отклонил сообщение", "queued": "ожидает отправки"}[d.Status]
+	if label == "" {
+		label = "нет активного соединения"
+	}
+	if d.NextAttempt > 0 {
+		seconds := max(int64(0), (d.NextAttempt-time.Now().UnixMilli()+999)/1000)
+		label += fmt.Sprintf(" · повтор через %d с", seconds)
+	}
+	return label
+}
+
+type Connection struct {
+	Peer    string `json:"peer"`
+	Address string `json:"address"`
+	Relay   bool   `json:"relay"`
+}
+type Snapshot struct {
+	Peer         string                  `json:"peer"`
+	Reachability string                  `json:"reachability"`
+	Addresses    []string                `json:"addresses"`
+	Connections  []Connection            `json:"connections"`
+	Queued       int                     `json:"queued"`
+	Messages     []Entry                 `json:"messages"`
+	Peers        map[string]PeerDelivery `json:"peers"`
+}
+type ControlRequest struct {
+	Op   string `json:"op"`
+	To   string `json:"to,omitempty"`
+	Text string `json:"text,omitempty"`
+}
+type ControlReply struct {
+	State *Snapshot `json:"state,omitempty"`
+	ID    string    `json:"id,omitempty"`
+	Error string    `json:"error,omitempty"`
+}
+
+func (n *Node) snapshot() Snapshot {
+	n.mu.Lock()
+	s := Snapshot{Peer: n.h.ID().String(), Reachability: n.reach.String(), Messages: append([]Entry{}, n.state.Messages...), Peers: map[string]PeerDelivery{}}
+	for id, d := range n.delivery {
+		// A successful past delivery is not proof that the peer is still online.
+		if d.Status != "connected" {
+			s.Peers[id] = d
 		}
 	}
 	n.mu.Unlock()
-	addresses := []string{}
-	for _, a := range n.h.Addrs() {
-		addresses = append(addresses, a.String()+"/p2p/"+n.h.ID().String())
-	}
-	connections := []map[string]any{}
-	for _, c := range n.h.Network().Conns() {
-		connections = append(connections, map[string]any{"peer": c.RemotePeer().String(), "address": c.RemoteMultiaddr().String(), "relay": c.Stat().Limited})
-	}
-	pub, _ := crypto.MarshalPublicKey(n.key.GetPublic())
-	return map[string]any{"peer": n.h.ID().String(), "public_key": base64.StdEncoding.EncodeToString(pub), "reachability": reach, "addresses": addresses, "connections": connections, "queued": queued}
-}
-func (n *Node) uiHandler(listenHost string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = io.WriteString(w, strings.ReplaceAll(page, "__TOKEN__", n.token))
-	})
-	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) { jsonReply(w, n.status()) })
-	mux.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
-		n.mu.Lock()
-		defer n.mu.Unlock()
-		jsonReply(w, n.state.Messages)
-	})
-	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "POST required", 405)
-			return
-		}
-		var q struct {
-			To   string `json:"to"`
-			Text string `json:"text"`
-		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 20000)).Decode(&q); err != nil {
-			http.Error(w, "invalid request", 400)
-			return
-		}
-		id, err := n.queue(q.To, q.Text)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		jsonReply(w, map[string]string{"id": id})
-	})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'nonce-"+n.token+"'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
-		hostname, _, err := net.SplitHostPort(r.Host)
-		if err != nil {
-			hostname = r.Host
-		}
-		if hostname != "localhost" && hostname != listenHost && hostname != "127.0.0.1" && hostname != "::1" {
-			http.Error(w, "invalid Host", 403)
-			return
-		}
-		if origin := r.Header.Get("Origin"); origin != "" {
-			u, e := url.Parse(origin)
-			if e != nil || u.Host != r.Host || u.Scheme != "http" {
-				http.Error(w, "invalid Origin", 403)
-				return
+	for _, e := range s.Messages {
+		if e.Status == "queued" {
+			s.Queued++
+			if _, ok := s.Peers[e.Message.Body.To]; !ok {
+				s.Peers[e.Message.Body.To] = PeerDelivery{Status: "queued", Detail: e.Error}
 			}
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/") && r.Header.Get("X-Node-Token") != n.token {
-			http.Error(w, "invalid token", 403)
-			return
+	}
+	for _, a := range n.h.Addrs() {
+		s.Addresses = append(s.Addresses, a.String()+"/p2p/"+s.Peer)
+	}
+	for _, c := range n.h.Network().Conns() {
+		s.Connections = append(s.Connections, Connection{c.RemotePeer().String(), c.RemoteMultiaddr().String(), c.Stat().Limited})
+		if d, ok := s.Peers[c.RemotePeer().String()]; !ok || d.Status == "queued" {
+			s.Peers[c.RemotePeer().String()] = PeerDelivery{Status: "connected"}
 		}
-		if r.Method != "GET" && r.URL.Path != "/api/send" {
-			http.Error(w, "method not allowed", 405)
-			return
+	}
+	return s
+}
+func controlCall(dir string, q ControlRequest) (ControlReply, error) {
+	var reply ControlReply
+	c, err := net.DialTimeout("unix", filepath.Join(dir, "control.sock"), 2*time.Second)
+	if err != nil {
+		return reply, fmt.Errorf("cannot connect to node: %w", err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if err = json.NewEncoder(c).Encode(q); err == nil {
+		err = json.NewDecoder(io.LimitReader(c, 512<<20)).Decode(&reply)
+	}
+	if err == nil && reply.Error != "" {
+		err = errors.New(reply.Error)
+	}
+	return reply, err
+}
+func (n *Node) controlServer() (net.Listener, error) {
+	path := filepath.Join(n.dir, "control.sock")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err = os.Chmod(path, 0600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case n.sem <- struct{}{}:
+				go func() {
+					defer c.Close()
+					defer func() { <-n.sem }()
+					_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+					var q ControlRequest
+					if json.NewDecoder(io.LimitReader(c, maxFrame)).Decode(&q) != nil {
+						return
+					}
+					var res ControlReply
+					switch q.Op {
+					case "snapshot":
+						s := n.snapshot()
+						res.State = &s
+					case "send":
+						id, err := n.queue(q.To, q.Text)
+						res.ID = id
+						if err != nil {
+							res.Error = err.Error()
+						}
+					default:
+						res.Error = "unknown local command"
+					}
+					_ = json.NewEncoder(c).Encode(res)
+				}()
+			default:
+				c.Close()
+			}
 		}
-		mux.ServeHTTP(w, r)
+	}()
+	return ln, nil
+}
+
+type Config struct {
+	Port         int    `json:"port"`
+	DirectPort   int    `json:"direct_port"`
+	Bootstrap    string `json:"bootstrap"`
+	Announce     string `json:"announce"`
+	Reachability string `json:"reachability"`
+	TLSCert      string `json:"tls_cert"`
+	TLSKey       string `json:"tls_key"`
+}
+
+func defaultData() string {
+	if base := os.Getenv("XDG_DATA_HOME"); base != "" {
+		return filepath.Join(base, "p2pmessenger")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "./node-data"
+	}
+	return filepath.Join(home, ".local", "share", "p2pmessenger")
+}
+func savedConfig(dir string, explicit Config, visited map[string]bool) (Config, error) {
+	cfg := Config{Port: 8081, DirectPort: 4002, Reachability: "auto"}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err == nil {
+		if err = json.Unmarshal(raw, &cfg); err != nil {
+			return cfg, fmt.Errorf("config.json: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return cfg, err
+	}
+	for name := range visited {
+		switch name {
+		case "port":
+			cfg.Port = explicit.Port
+		case "direct-port":
+			cfg.DirectPort = explicit.DirectPort
+		case "bootstrap":
+			cfg.Bootstrap = explicit.Bootstrap
+		case "announce":
+			cfg.Announce = explicit.Announce
+		case "reachability":
+			cfg.Reachability = explicit.Reachability
+		case "tls-cert":
+			cfg.TLSCert = explicit.TLSCert
+		case "tls-key":
+			cfg.TLSKey = explicit.TLSKey
+		}
+	}
+	return cfg, nil
+}
+
+// Strip terminal controls from remote text and escape tview style markup.
+func terminalText(s string) string {
+	return tview.Escape(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, s))
+}
+func deliveryLabel(status string) string {
+	switch status {
+	case "queued":
+		return "в очереди"
+	case "delivered":
+		return "доставлено"
+	case "received":
+		return "получено"
+	}
+	return status
+}
+
+type TerminalUI struct {
+	app                           *tview.Application
+	root                          *tview.Flex
+	pages                         *tview.Pages
+	header, history, notice, info *tview.TextView
+	contacts                      *tview.List
+	recipient                     *tview.InputField
+	compose                       *tview.TextArea
+	send                          *tview.Button
+	active                        string
+	peers                         []string
+	lastHistory                   string
+	lastContacts                  string
+	state                         Snapshot
+	request                       func(ControlRequest) (ControlReply, error)
+}
+
+func newTerminalUI(call func(ControlRequest) (ControlReply, error)) *TerminalUI {
+	u := &TerminalUI{app: tview.NewApplication(), request: call}
+	u.header = tview.NewTextView().SetDynamicColors(true)
+	u.notice = tview.NewTextView().SetDynamicColors(true).SetText("Tab: перейти • Enter: отправить • Alt+Enter: новая строка • F2: сеть • F3: копировать ID • Ctrl+Q: выход")
+	u.history = tview.NewTextView().SetDynamicColors(true).SetScrollable(true).SetWordWrap(true)
+	u.history.SetBorder(true).SetTitle(" Беседа ")
+	u.info = tview.NewTextView().SetDynamicColors(true).SetScrollable(true).SetWordWrap(true)
+	u.info.SetBorder(true).SetTitle(" Узел и соединения · Esc/F2: закрыть ")
+	u.contacts = tview.NewList().ShowSecondaryText(false).SetUseStyleTags(false, false)
+	u.contacts.SetBorder(true).SetTitle(" Беседы ")
+	u.recipient = tview.NewInputField().SetLabel("Кому: ").SetPlaceholder("Вставьте Peer ID и нажмите Enter")
+	u.compose = tview.NewTextArea().SetPlaceholder("Сообщение…").SetMaxLength(16000)
+	u.compose.SetBorder(true).SetTitle(" Сообщение ")
+	u.send = tview.NewButton("Отправить").SetSelectedFunc(u.sendMessage)
+	u.contacts.SetSelectedFunc(func(i int, _, _ string, _ rune) {
+		if i < len(u.peers) {
+			u.selectPeer(u.peers[i])
+		}
 	})
+	u.recipient.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			u.selectPeer(strings.TrimSpace(u.recipient.GetText()))
+		}
+	})
+	u.compose.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+		if e.Key() == tcell.KeyEnter {
+			if e.Modifiers()&tcell.ModAlt != 0 {
+				u.compose.PasteHandler()("\n", func(p tview.Primitive) { u.app.SetFocus(p) })
+			} else {
+				u.sendMessage()
+			}
+			return nil
+		}
+		return e
+	})
+	content := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(u.recipient, 1, 0, false).AddItem(u.history, 0, 1, false).AddItem(u.compose, 5, 0, true).AddItem(u.send, 1, 0, false)
+	body := tview.NewFlex().AddItem(u.contacts, 24, 0, false).AddItem(content, 0, 1, true)
+	u.root = tview.NewFlex().SetDirection(tview.FlexRow).AddItem(u.header, 3, 0, false).AddItem(body, 0, 1, true).AddItem(u.notice, 2, 0, false)
+	u.pages = tview.NewPages().AddPage("chat", u.root, true, true).AddPage("info", u.info, true, false)
+	focus := []tview.Primitive{u.recipient, u.contacts, u.history, u.compose, u.send}
+	u.app.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+		switch e.Key() {
+		case tcell.KeyCtrlC, tcell.KeyCtrlQ:
+			u.app.Stop()
+			return nil
+		case tcell.KeyF3:
+			// OSC 52 lets supporting local terminals and SSH sessions copy an ID.
+			fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(u.state.Peer)))
+			u.notice.SetText("Peer ID передан терминалу для копирования; полный ID доступен по F2")
+			return nil
+		case tcell.KeyF2:
+			if u.pages.HasFocus() && u.pages.GetPageCount() > 0 {
+				name, _ := u.pages.GetFrontPage()
+				if name == "info" {
+					u.pages.HidePage("info")
+					u.app.SetFocus(u.compose)
+				} else {
+					u.pages.ShowPage("info")
+					u.app.SetFocus(u.info)
+				}
+			}
+			return nil
+		case tcell.KeyEscape:
+			u.pages.HidePage("info")
+			u.app.SetFocus(u.compose)
+			return nil
+		case tcell.KeyCtrlS:
+			u.sendMessage()
+			return nil
+		case tcell.KeyTab, tcell.KeyBacktab:
+			name, _ := u.pages.GetFrontPage()
+			if name == "info" {
+				return nil
+			}
+			for i, p := range focus {
+				if p.HasFocus() {
+					delta := 1
+					if e.Key() == tcell.KeyBacktab {
+						delta = len(focus) - 1
+					}
+					u.app.SetFocus(focus[(i+delta)%len(focus)])
+					return nil
+				}
+			}
+		}
+		return e
+	})
+	u.app.SetRoot(u.pages, true).EnableMouse(true).EnablePaste(true).SetFocus(u.recipient)
+	return u
+}
+func (u *TerminalUI) selectPeer(id string) {
+	if _, err := peer.Decode(id); err != nil {
+		u.notice.SetText("[red]Некорректный Peer ID[-]")
+		return
+	}
+	if id == u.state.Peer {
+		u.notice.SetText("[red]Выберите другого пира[-]")
+		return
+	}
+	u.active = id
+	u.recipient.SetText(id)
+	u.lastHistory = ""
+	u.update(u.state)
+	u.app.SetFocus(u.compose)
+}
+func (u *TerminalUI) sendMessage() {
+	to, text := strings.TrimSpace(u.recipient.GetText()), u.compose.GetText()
+	if _, err := peer.Decode(to); err != nil {
+		u.notice.SetText("[red]Введите Peer ID собеседника[-]")
+		return
+	}
+	// Queueing is a local durable operation; it never waits for a network peer.
+	res, err := u.request(ControlRequest{Op: "send", To: to, Text: text})
+	if err != nil {
+		u.notice.SetText("[red]" + terminalText(err.Error()) + "[-]")
+		return
+	}
+	u.compose.SetText("", true)
+	u.active = to
+	u.lastHistory = ""
+	u.notice.SetText("[green]В очереди: " + res.ID + "[-]")
+}
+func (u *TerminalUI) update(s Snapshot) {
+	u.state = s
+	role := map[string]string{"Public": "публичный", "Private": "за NAT", "Unknown": "определяем доступность"}[s.Reachability]
+	u.header.SetText(fmt.Sprintf("[green]Связь / P2P[-] · %s · соединений %d · в очереди %d\nВаш Peer ID: %s", role, len(s.Connections), s.Queued, s.Peer))
+	seen := map[string]bool{}
+	var peers []string
+	add := func(p string) {
+		if p != "" && p != s.Peer && !seen[p] {
+			seen[p] = true
+			peers = append(peers, p)
+		}
+	}
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		b := s.Messages[i].Message.Body
+		if b.From == s.Peer {
+			add(b.To)
+		} else {
+			add(b.From)
+		}
+	}
+	add(u.active)
+	var labels []string
+	for _, p := range peers {
+		labels = append(labels, p+":"+s.Peers[p].Status)
+	}
+	key := strings.Join(labels, ",")
+	if key != u.lastContacts {
+		u.lastContacts = key
+		current := u.contacts.GetCurrentItem()
+		selected := ""
+		if current >= 0 && current < len(u.peers) {
+			selected = u.peers[current]
+		}
+		u.contacts.Clear()
+		u.peers = peers
+		for i, p := range peers {
+			label := p
+			if len(label) > 12 {
+				label = label[len(label)-12:]
+			}
+			mark := "○ "
+			if s.Peers[p].Status == "connected" {
+				mark = "● "
+			}
+			u.contacts.AddItem(mark+label, "", 0, nil)
+			if p == selected {
+				current = i
+			}
+		}
+		if current < len(peers) {
+			u.contacts.SetCurrentItem(current)
+		}
+	}
+	var chat strings.Builder
+	if u.active != "" {
+		u.history.SetTitle(" Беседа · " + peerDeliveryLabel(s.Peers[u.active]) + " ")
+	}
+	for _, e := range s.Messages {
+		b := e.Message.Body
+		if b.From != u.active && b.To != u.active {
+			continue
+		}
+		name := "Собеседник"
+		color := "white"
+		if b.From == s.Peer {
+			name = "Вы"
+			color = "green"
+		}
+		fmt.Fprintf(&chat, "[%s]%s · %s · %s[-]\n%s\n", color, name, time.UnixMilli(b.Time).Local().Format("02.01 15:04:05"), deliveryLabel(e.Status), terminalText(b.Text))
+		if e.Error != "" {
+			fmt.Fprintln(&chat, "[yellow]Не доставлено. Сообщение сохранено; повторим автоматически. Причина — F2.[-]")
+		}
+		chat.WriteByte('\n')
+	}
+	text := chat.String()
+	if text == "" {
+		text = "Выберите беседу или вставьте Peer ID в поле «Кому»."
+	}
+	if text != u.lastHistory {
+		u.lastHistory = text
+		u.history.SetText(text).ScrollToEnd()
+	}
+	var info strings.Builder
+	fmt.Fprintf(&info, "[green]Ваш Peer ID[-]\n%s\n\n[green]Адреса[-]\n%s\n\n[green]Соединения[-]\n", terminalText(s.Peer), terminalText(strings.Join(s.Addresses, "\n")))
+	for _, c := range s.Connections {
+		kind := "прямое"
+		if c.Relay {
+			kind = "реле"
+		}
+		fmt.Fprintf(&info, "%s\n%s · %s\n\n", terminalText(c.Peer), kind, terminalText(c.Address))
+	}
+	info.WriteString("\n[green]Доставка собеседникам[-]\n")
+	ids := make([]string, 0, len(s.Peers))
+	for id := range s.Peers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		d := s.Peers[id]
+		fmt.Fprintf(&info, "%s\n%s\n%s\n\n", terminalText(id), peerDeliveryLabel(d), terminalText(d.Detail))
+	}
+	u.info.SetText(info.String())
+}
+func terminalUI(ctx context.Context, call func(ControlRequest) (ControlReply, error)) error {
+	u := newTerminalUI(call)
+	initial, err := call(ControlRequest{Op: "snapshot"})
+	if err != nil {
+		return err
+	}
+	if initial.State == nil {
+		return errors.New("node returned no state")
+	}
+	u.update(*initial.State)
+	// QueueUpdateDraw blocks until consumed; launching the producer after the first
+	// draw guarantees an event loop is present, including during terminal startup.
+	done := make(chan struct{})
+	defer close(done)
+	var once sync.Once
+	u.app.SetAfterDrawFunc(func(tcell.Screen) {
+		once.Do(func() {
+			go func() {
+				tick := time.NewTicker(time.Second)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						u.app.Stop()
+						return
+					case <-done:
+						return
+					case <-tick.C:
+						res, err := call(ControlRequest{Op: "snapshot"})
+						if err != nil {
+							u.app.QueueUpdateDraw(func() { u.notice.SetText("[red]" + terminalText(err.Error()) + "[-]") })
+						} else if res.State != nil {
+							u.app.QueueUpdateDraw(func() { u.update(*res.State) })
+						}
+					}
+				}
+			}()
+		})
+	})
+	return u.app.Run()
 }
 
 func run() error {
-	dir := flag.String("data", "./node-data", "identity and message storage directory")
-	ui := flag.String("ui", "127.0.0.1:8080", "local browser interface (loopback only)")
-	port := flag.Int("port", 0, "WS/WSS port; default 80 without TLS, 443 with TLS")
-	cert := flag.String("tls-cert", "", "PEM TLS certificate, including intermediate chain")
-	keyfile := flag.String("tls-key", "", "PEM TLS private key")
-	bootstrap := flag.String("bootstrap", "", "comma-separated public peer multiaddresses including /p2p/ID")
-	announce := flag.String("announce", "", "comma-separated external multiaddresses without /p2p/ID")
-	mode := flag.String("reachability", "auto", "auto, public, private (override for testing or known network setup)")
-	directPort := flag.Int("direct-port", 4002, "TCP and UDP/QUIC port for direct NAT traversal; 0 disables extra transports")
+	dir := flag.String("data", defaultData(), "identity, history and saved settings directory")
+	headless := flag.Bool("headless", false, "run as a service without terminal interface")
+	attach := flag.Bool("attach", false, "open terminal interface of an already running node")
+	status := flag.Bool("status", false, "print running node status and history as JSON")
+	send := flag.String("send", "", "queue a message to this Peer ID on a running node")
+	message := flag.String("message", "", "text for --send")
+	_ = flag.String("ui", "", "deprecated: browser UI removed; use --attach")
+	var cfg Config
+	flag.IntVar(&cfg.Port, "port", 8081, "WS/WSS port (use 80/443 on public nodes)")
+	flag.IntVar(&cfg.DirectPort, "direct-port", 4002, "TCP and UDP/QUIC port; 0 disables extra transports")
+	flag.StringVar(&cfg.Bootstrap, "bootstrap", "", "comma-separated public peer multiaddresses")
+	flag.StringVar(&cfg.Announce, "announce", "", "comma-separated external multiaddresses")
+	flag.StringVar(&cfg.Reachability, "reachability", "auto", "auto, public, private")
+	flag.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM TLS certificate chain")
+	flag.StringVar(&cfg.TLSKey, "tls-key", "", "PEM TLS private key")
 	flag.Parse()
+	if flag.NArg() > 0 {
+		return errors.New("unexpected positional arguments; use one line without backslashes, or put each backslash at the end of a line")
+	}
+	if *attach || *status || *send != "" {
+		if (*attach && (*status || *send != "")) || (*status && *send != "") {
+			return errors.New("choose one of --attach, --status or --send")
+		}
+		if *attach {
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+			return terminalUI(ctx, func(q ControlRequest) (ControlReply, error) { return controlCall(*dir, q) })
+		}
+		q := ControlRequest{Op: "snapshot"}
+		if *send != "" {
+			q = ControlRequest{Op: "send", To: *send, Text: *message}
+		}
+		res, err := controlCall(*dir, q)
+		if err != nil {
+			return err
+		}
+		if *status {
+			return json.NewEncoder(os.Stdout).Encode(res.State)
+		}
+		fmt.Println(res.ID)
+		return nil
+	}
+	visited := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	var err error
+	cfg, err = savedConfig(*dir, cfg, visited)
+	if err != nil {
+		return err
+	}
+	port, directPort, cert, keyfile, bootstrap, announce, mode := &cfg.Port, &cfg.DirectPort, &cfg.TLSCert, &cfg.TLSKey, &cfg.Bootstrap, &cfg.Announce, &cfg.Reachability
+	interactive := !*headless && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 	if (*cert == "") != (*keyfile == "") {
 		return errors.New("both --tls-cert and --tls-key are required")
-	}
-	if *port == 0 {
-		if *cert != "" {
-			*port = 443
-		} else {
-			*port = 80
-		}
 	}
 	if *port < 1 || *port > 65535 || *directPort < 0 || *directPort > 65535 {
 		return errors.New("invalid port")
 	}
 	if *directPort == *port {
 		return errors.New("--direct-port must differ from --port")
-	}
-	uiHost, _, err := net.SplitHostPort(*ui)
-	if err != nil {
-		return err
-	}
-	ip := net.ParseIP(uiHost)
-	if ip == nil || !ip.IsLoopback() {
-		return errors.New("--ui must bind a loopback IP (127.0.0.1 or ::1)")
 	}
 	if err = os.MkdirAll(*dir, 0700); err != nil {
 		return err
@@ -873,7 +1349,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	n := &Node{key: identity, dir: *dir, routes: map[peer.ID]Route{}, wake: make(chan struct{}, 1), sendWake: make(chan struct{}, 1), sem: make(chan struct{}, 64), token: randomID(), reach: network.ReachabilityUnknown}
+	n := &Node{key: identity, dir: *dir, routes: map[peer.ID]Route{}, wake: make(chan struct{}, 1), sendWake: make(chan struct{}, 1), sem: make(chan struct{}, 64), reach: network.ReachabilityUnknown}
 	raw, err := os.ReadFile(filepath.Join(*dir, "state.json"))
 	if err == nil {
 		if err = json.Unmarshal(raw, &n.state); err != nil {
@@ -884,6 +1360,15 @@ func run() error {
 	}
 	if len(n.state.Messages) > maxHistory {
 		return errors.New("state history exceeds limit")
+	}
+	if raw, e := os.ReadFile(filepath.Join(*dir, "sequence.json")); e == nil {
+		var seq uint64
+		if e = json.Unmarshal(raw, &seq); e != nil {
+			return fmt.Errorf("sequence.json: %w", e)
+		}
+		n.state.Sequence = max(n.state.Sequence, seq)
+	} else if !os.IsNotExist(e) {
+		return e
 	}
 	for _, s := range strings.Split(*bootstrap, ",") {
 		if strings.TrimSpace(s) == "" {
@@ -919,7 +1404,7 @@ func run() error {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = io.WriteString(w, "P2P messenger node. Open the local interface on 127.0.0.1:8080.\n")
+		_, _ = io.WriteString(w, "P2P messenger node. Use the terminal interface.\n")
 	})
 	wsopts := []websocket.Option{websocket.WithHTTPHandler(publicHTTP)}
 	suffix := "ws"
@@ -971,15 +1456,25 @@ func run() error {
 	n.h.SetStreamHandler(messageProtocol, n.bounded(n.handleMessage))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	ln, err := net.Listen("tcp", *ui)
+	if err = atomicWrite(filepath.Join(*dir, "config.json"), bytesOf(cfg)); err != nil {
+		return err
+	}
+	control, err := n.controlServer()
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Handler: n.uiHandler(uiHost), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(ln) }()
+	defer control.Close()
+	// Keep logs off the terminal canvas. Headless services continue logging to stderr.
+	if interactive {
+		f, e := os.OpenFile(filepath.Join(*dir, "node.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if e != nil {
+			return e
+		}
+		previous := log.Writer()
+		log.SetOutput(f)
+		defer func() { log.SetOutput(previous); f.Close() }()
+	}
 	log.Printf("Peer ID: %s", n.h.ID())
-	log.Printf("interface: http://%s", ln.Addr())
 	for _, a := range n.h.Addrs() {
 		log.Printf("address: %s/p2p/%s", a, n.h.ID())
 	}
@@ -990,17 +1485,15 @@ func run() error {
 	workers.Add(2)
 	go func() { defer workers.Done(); n.maintain(ctx) }()
 	go func() { defer workers.Done(); n.sendLoop(ctx) }()
-	select {
-	case <-ctx.Done():
-	case err = <-serveErr:
-		cancel()
+	if interactive {
+		err = terminalUI(ctx, func(q ControlRequest) (ControlReply, error) { return controlCall(*dir, q) })
+	} else {
+		<-ctx.Done()
+		err = nil
 	}
 	cancel()
-	_ = server.Close()
+	_ = control.Close()
 	workers.Wait()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
 	return err
 }
 func main() {
@@ -1008,21 +1501,3 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
-const page = `<!doctype html>
-<html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Связь · P2P</title>
-<style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10141b;color:#e5eaf2}*{box-sizing:border-box}body{margin:0}main{max-width:1100px;margin:auto;padding:28px}header{display:flex;align-items:center;justify-content:space-between;gap:18px}h1{font-size:27px;margin:0}small,.muted{color:#9baabd}#role{background:#233546;padding:8px 12px;border-radius:20px;font-size:13px}.layout{display:grid;grid-template-columns:310px 1fr;gap:20px;margin-top:24px}.card{background:#181f2a;border:1px solid #2b3646;border-radius:16px;padding:20px;min-width:0}label{display:block;font-size:13px;color:#aebed0;margin-bottom:8px}input,textarea,button{font:inherit;border-radius:9px;border:1px solid #38465b;padding:11px;background:#101722;color:#e5eaf2;width:100%}textarea{resize:vertical;min-height:82px}button{background:#b5f380;color:#142008;border:0;cursor:pointer;font-weight:600}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:10px;margin-top:10px}.row button{width:auto}code{display:block;overflow-wrap:anywhere;font-size:12px;line-height:1.65;color:#b5f380}.section{margin-top:22px}#messages{height:410px;overflow:auto;display:flex;flex-direction:column;gap:12px;padding:12px 0}.bubble{max-width:90%;align-self:flex-start;background:#263346;padding:12px 15px;border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere}.bubble.mine{align-self:flex-end;background:#284330}.bubble small{display:block;font-size:11px;margin-top:6px}.error{color:#f4b0a2;font-size:13px;overflow-wrap:anywhere}#contacts button{background:#243143;color:#dbe5f3;font-size:12px;overflow-wrap:anywhere;text-align:left;margin-top:7px}details{margin-top:16px;font-size:13px}summary{cursor:pointer;color:#aebed0}#connections{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}#notice{min-height:22px}a{color:#b5f380}@media(max-width:760px){main{padding:15px}.layout{grid-template-columns:1fr}#messages{height:350px}}
-</style>
-<main><header><div><h1>Связь <span class="muted">/ P2P</span></h1><small>Личные сообщения · ключ вместо аккаунта</small></div><span id="role">Подключение…</span></header>
-<div class="layout"><aside class="card"><label>Ваш Peer ID · адрес для собеседника</label><code id="identity"></code><div class="row"><button id="copy">Копировать</button></div><div class="section"><label>Собеседник</label><input id="recipient" placeholder="12D3KooW…" autocomplete="off" spellcheck="false"></div><div id="contacts" class="section"></div><details><summary>Адреса узла</summary><code id="addresses"></code></details><details><summary>Соединения</summary><div id="connections"></div></details><div class="section"><small>Ключи и история хранятся у этого узла. Для доставки оба узла должны работать; при обрыве сообщение остаётся в очереди.</small></div></aside>
-<section class="card"><label id="chatTitle">Личная беседа</label><div id="messages"><p class="muted">Вставьте Peer ID собеседника, чтобы начать общение.</p></div><form id="form"><textarea id="text" placeholder="Написать сообщение…" maxlength="16000" required></textarea><div class="row"><button id="send" type="submit">Отправить</button></div><p id="notice" class="error" role="status"></p></form><small>Канал защищён между пирами, в том числе при передаче через реле.</small></section></div></main>
-<script nonce="__TOKEN__">
-const token='__TOKEN__', el=id=>document.getElementById(id);let self='',entries=[],lastRender='';
-async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-Node-Token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(await r.text());return r.json()}
-function render(){const peer=el('recipient').value.trim(), filtered=entries.filter(e=>e.message.body.from===peer||e.message.body.to===peer),key=JSON.stringify([peer,filtered]);if(key===lastRender)return;lastRender=key;el('messages').replaceChildren();if(!filtered.length){const p=document.createElement('p');p.className='muted';p.textContent=peer?'Сообщений пока нет.':'Вставьте Peer ID собеседника, чтобы начать общение.';el('messages').append(p)}for(const e of filtered){const b=e.message.body,d=document.createElement('div');d.className='bubble'+(b.from===self?' mine':'');d.textContent=b.text;const s=document.createElement('small');s.textContent=new Date(b.time).toLocaleString()+' · '+({queued:'В очереди',delivered:'Доставлено',received:'Получено'}[e.status]||e.status);d.append(s);if(e.error){const er=document.createElement('small');er.className='error';er.textContent=e.error;d.append(er)}el('messages').append(d)}el('messages').scrollTop=el('messages').scrollHeight}
-async function refresh(){try{const [s,m]=await Promise.all([api('/api/status'),api('/api/messages')]);self=s.peer;entries=m||[];el('identity').textContent=self;el('role').textContent=({Public:'Публичный узел',Private:'За NAT',Unknown:'Определяем доступность'}[s.reachability]||s.reachability)+' · '+s.connections.length+' соед.';el('addresses').textContent=s.addresses.join('\n');el('connections').textContent=s.connections.map(c=>c.peer+'\n'+(c.relay?'Реле':'Прямое')+' · '+c.address).join('\n\n')||'Нет соединений';const peers=[...new Set(entries.map(e=>e.message.body.from===self?e.message.body.to:e.message.body.from))];el('contacts').replaceChildren();for(const p of peers){const b=document.createElement('button');b.textContent=p;b.onclick=()=>{el('recipient').value=p;render()};el('contacts').append(b)}render()}catch(e){el('notice').textContent='Нет связи с локальным узлом: '+e.message}}
-el('recipient').addEventListener('input',render);el('copy').onclick=async()=>{try{await navigator.clipboard.writeText(self);el('notice').textContent='Peer ID скопирован'}catch{el('notice').textContent='Выделите и скопируйте Peer ID вручную'}};
-el('form').onsubmit=async e=>{e.preventDefault();el('send').disabled=true;try{await api('/api/send',{to:el('recipient').value.trim(),text:el('text').value});el('text').value='';el('notice').textContent='Сообщение добавлено в очередь';await refresh()}catch(e){el('notice').textContent=e.message}finally{el('send').disabled=false}};
-async function poll(){await refresh();setTimeout(poll,2000)}poll();
-</script></html>`

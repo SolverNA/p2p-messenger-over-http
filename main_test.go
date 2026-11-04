@@ -248,3 +248,159 @@ func TestPersistentOutbox(t *testing.T) {
 	<-done
 	t.Fatal("queued message was not delivered")
 }
+
+func TestConfigOverridesKeepSavedValues(t *testing.T) {
+	dir := t.TempDir()
+	saved := Config{Port: 8089, DirectPort: 4009, Bootstrap: "previous", Reachability: "private"}
+	if err := atomicWrite(filepath.Join(dir, "config.json"), bytesOf(saved)); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := savedConfig(dir, Config{Port: 8090}, map[string]bool{"port": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 8090 || cfg.DirectPort != 4009 || cfg.Bootstrap != "previous" || cfg.Reachability != "private" {
+		t.Fatalf("settings lost: %+v", cfg)
+	}
+	cfg, err = savedConfig(dir, Config{Bootstrap: ""}, map[string]bool{"bootstrap": true})
+	if err != nil || cfg.Bootstrap != "" {
+		t.Fatal("explicit empty flag did not clear saved bootstrap", err)
+	}
+}
+func TestRouteRefreshDoesNotRewriteHistory(t *testing.T) {
+	n := testNode(t)
+	if _, err := n.localRoute(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(n.dir, "state.json")); !os.IsNotExist(err) {
+		t.Fatal("address refresh unnecessarily wrote chat history")
+	}
+	raw, err := os.ReadFile(filepath.Join(n.dir, "sequence.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq uint64
+	if json.Unmarshal(raw, &seq) != nil || seq != n.state.Sequence {
+		t.Fatal("routing counter was not persisted")
+	}
+}
+
+func TestOfflinePeerDoesNotBlockOthersAndRecovers(t *testing.T) {
+	a, offline, online := testNode(t), testNode(t), testNode(t)
+	connectTest(t, a, online)
+	if _, err := a.queue(offline.h.ID().String(), "Ждёт возвращения"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.queue(online.h.ID().String(), "Доступному собеседнику"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
+	done := make(chan struct{})
+	go func() { defer close(done); a.sendLoop(ctx) }()
+	defer func() { cancel(); <-done }()
+	notify(a.sendWake)
+	failed := false
+	for ctx.Err() == nil {
+		a.mu.Lock()
+		d := a.delivery[offline.h.ID().String()]
+		onlineDelivered := a.state.Messages[1].Status == "delivered"
+		a.mu.Unlock()
+		if d.Status == "unavailable" && onlineDelivered {
+			if d.NextAttempt <= time.Now().UnixMilli() || d.Failures != 1 {
+				t.Fatal("missing retry information")
+			}
+			failed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !failed {
+		t.Fatal("offline recipient blocked another recipient or failure was not reported")
+	}
+	connectTest(t, a, offline)
+	for ctx.Err() == nil {
+		a.mu.Lock()
+		delivered := a.state.Messages[0].Status == "delivered"
+		d := a.delivery[offline.h.ID().String()]
+		a.mu.Unlock()
+		if delivered {
+			if d.Status != "connected" || d.Failures != 0 || d.NextAttempt != 0 {
+				t.Fatal("failure state was not cleared after recovery")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("message was not delivered after recipient became reachable")
+}
+func TestConnectionFailureAndRecipientRejection(t *testing.T) {
+	t.Run("stale address", func(t *testing.T) {
+		a, b := testNode(t), testNode(t)
+		r, err := b.localRoute()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = a.remember(r); err != nil {
+			t.Fatal(err)
+		}
+		b.h.Close()
+		_, err = a.queue(b.h.ID().String(), "Попытка на закрытый порт")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if a.deliver(ctx, a.state.Messages[0].Message) == nil {
+			t.Fatal("closed recipient unexpectedly accepted message")
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		d := a.delivery[b.h.ID().String()]
+		if d.Status != "connect_failed" || d.Detail == "" || d.NextAttempt == 0 {
+			t.Fatalf("wrong failure state: %+v", d)
+		}
+	})
+	t.Run("recipient refuses", func(t *testing.T) {
+		a, b := testNode(t), testNode(t)
+		connectTest(t, a, b)
+		b.mu.Lock()
+		b.state.Messages = make([]Entry, maxHistory)
+		b.mu.Unlock()
+		_, err := a.queue(b.h.ID().String(), "Нет места в истории получателя")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if a.deliver(ctx, a.state.Messages[0].Message) == nil {
+			t.Fatal("rejection treated as successful delivery")
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.delivery[b.h.ID().String()].Status != "rejected" || a.state.Messages[0].Status != "queued" {
+			t.Fatal("recipient rejection was not retained as pending")
+		}
+	})
+}
+
+func TestPastDeliveryDoesNotClaimPeerStillOnline(t *testing.T) {
+	a, b := testNode(t), testNode(t)
+	connectTest(t, a, b)
+	if _, err := a.queue(b.h.ID().String(), "before disconnect"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := a.deliver(ctx, a.state.Messages[0].Message); err != nil {
+		t.Fatal(err)
+	}
+	if a.snapshot().Peers[b.h.ID().String()].Status != "connected" {
+		t.Fatal("live connection missing")
+	}
+	if err := a.h.Network().ClosePeer(b.h.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if a.snapshot().Peers[b.h.ID().String()].Status == "connected" {
+		t.Fatal("past delivery incorrectly shown as online")
+	}
+}
