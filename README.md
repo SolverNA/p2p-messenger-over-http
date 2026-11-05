@@ -155,3 +155,9 @@ Smoke-сценарий требует Node.js и OpenSSL только для п�
 Для дополнительной проверки совместимости с сохранённым старым бинарником `messenger`: `P2P_LEGACY_HUB=1 node tests/smoke.mjs`.
 
 Проверка через IPv6: `go test -race -run TestIPv6 -v ./...` проверяет доставку по WS, TCP, QUIC и через настоящее реле на `::1`. Сценарий `P2P_IP6=1 node tests/smoke.mjs` запускает бинарники с IPv6-слушателями, проверяет WSS и отсутствие перехода соединения на IPv4.
+
+## Windows x64
+
+Сборка: `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o messenger-windows-amd64.exe .`.
+
+В PowerShell, из папки с файлом: `.\messenger-windows-amd64.exe --bootstrap /ip4/PUBLIC_IP/tcp/80/ws/p2p/PUBLIC_PEER_ID`. После первого запуска настройки сохраняются, и достаточно `.\messenger-windows-amd64.exe`. По умолчанию данные находятся в `.local\share\p2pmessenger` внутри домашнего каталога пользователя. Для локального управления используется поддержка Unix-сокетов в современных Windows; поддержка старых версий Windows не проверялась. Синхронизация файла перед заменой сохраняется, а неподдерживаемая синхронизация каталога пропускается на Windows.

@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -145,6 +146,11 @@ func atomicWrite(path string, data []byte) error {
 	}
 	if err = os.Rename(name, path); err != nil {
 		return err
+	}
+	// Windows cannot FlushFileBuffers on a read-only directory handle. The
+	// temporary file itself has already been synced before replacing the target.
+	if runtime.GOOS == "windows" {
+		return nil
 	}
 	d, err := os.Open(filepath.Dir(path))
 	if err != nil {
