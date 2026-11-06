@@ -1,13 +1,13 @@
 # Запуск из GitHub Release
 
-Предлагаемое название репозитория: `p2p-messenger-over-http`. Ниже `OWNER/REPOSITORY` нужно заменить на настоящий путь GitHub. До создания репозитория и публикации релиза эти команды не сработают.
+Репозиторий: [SolverNA/p2p-messenger-over-http](https://github.com/SolverNA/p2p-messenger-over-http). Готовые сборки доступны в [GitHub Releases](https://github.com/SolverNA/p2p-messenger-over-http/releases).
 
 ## Linux и macOS
 
 Одна команда в **интерактивном терминале**:
 
 ```sh
-curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/OWNER/REPOSITORY/main/scripts/run.sh | P2PMESSENGER_REPO=OWNER/REPOSITORY sh -s -- --bootstrap /dns4/node.example.org/tcp/443/tls/ws/p2p/PEER_ID
+curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/SolverNA/p2p-messenger-over-http/main/scripts/run.sh | P2PMESSENGER_REPO=SolverNA/p2p-messenger-over-http sh -s -- --bootstrap /dns4/node.example.org/tcp/443/tls/ws/p2p/PEER_ID
 ```
 
 При следующих запусках можно убрать `--bootstrap`: настройки сохранены. Вместо `main` используйте настоящий основной branch, если он называется иначе. Для воспроизводимого запуска замените `main` на проверенный тег в URL скрипта и добавьте `P2PMESSENGER_VERSION=v0.1.0` рядом с `P2PMESSENGER_REPO`.
@@ -19,8 +19,8 @@ curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent
 Можно сначала сохранить и прочитать запускающий скрипт:
 
 ```sh
-curl -fL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/OWNER/REPOSITORY/main/scripts/run.sh -o run.sh
-P2PMESSENGER_REPO=OWNER/REPOSITORY sh ./run.sh --help
+curl -fL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/SolverNA/p2p-messenger-over-http/main/scripts/run.sh -o run.sh
+P2PMESSENGER_REPO=SolverNA/p2p-messenger-over-http sh ./run.sh --help
 ```
 
 ## Windows x64
@@ -28,7 +28,7 @@ P2PMESSENGER_REPO=OWNER/REPOSITORY sh ./run.sh --help
 В PowerShell:
 
 ```powershell
-$env:P2PMESSENGER_REPO='OWNER/REPOSITORY'; $p=Join-Path $env:TEMP ('p2pmessenger-'+[guid]::NewGuid().ToString('N')+'.ps1'); try { Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$env:P2PMESSENGER_REPO/main/scripts/run.ps1" -OutFile $p; & $p --bootstrap /dns4/node.example.org/tcp/443/tls/ws/p2p/PEER_ID } finally { Remove-Item -LiteralPath $p -ErrorAction SilentlyContinue }
+$env:P2PMESSENGER_REPO='SolverNA/p2p-messenger-over-http'; $p=Join-Path $env:TEMP ('p2pmessenger-'+[guid]::NewGuid().ToString('N')+'.ps1'); try { Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$env:P2PMESSENGER_REPO/main/scripts/run.ps1" -OutFile $p; & $p --bootstrap /dns4/node.example.org/tcp/443/tls/ws/p2p/PEER_ID } finally { Remove-Item -LiteralPath $p -ErrorAction SilentlyContinue }
 ```
 
 Если политика PowerShell запрещает выполнение скачанного скрипта, сначала просмотрите файл и используйте разрешённый в вашей системе способ запуска. Глобальное ослабление политики не требуется для самого мессенджера: можно скачать проверенный `.exe` из релиза напрямую. Windows ARM64 пока не входит в набор релиза.
