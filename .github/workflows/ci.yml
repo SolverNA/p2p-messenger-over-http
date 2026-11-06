@@ -29,5 +29,5 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
       - run: CGO_ENABLED=0 go build -trimpath -buildvcs=false -o messenger-tui .
-      - run: node tests/smoke.mjs
+      - run: P2P_IP4=1 node tests/smoke.mjs
       - run: P2P_IP6=1 node tests/smoke.mjs

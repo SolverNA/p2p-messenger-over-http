@@ -9,6 +9,7 @@ import http from 'node:http';
 import assert from 'node:assert/strict';
 const dir=mkdtempSync(join(tmpdir(),'p2pmessenger-')),binary=join(process.cwd(),'messenger-tui');
 const children=[];
+const nodes=[];
 let registryServer;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 // Stay outside Linux's usual ephemeral client-port range: an outbound libp2p
@@ -21,12 +22,18 @@ async function launch(name,extra=[]){
  const port=await freePort();let logs='';
  const legacy=name==='hub'&&process.env.P2P_LEGACY_HUB==='1';
  const mode=legacy?['--ui',`127.0.0.1:${await freePort()}`]:['--headless',...(name==='hub'?['--peer-list','off']:[])];
- const family=process.env.P2P_IP6==='1'?['--ip-family','6']:[];
+ // AutoRelay filters private/loopback relay addresses. Advertise a reserved
+ // example hostname so this fixture works even on hosts without a public IP.
+ // Clients keep their authenticated localhost connection to the same relay;
+ // the fixture never needs to resolve or dial the advertised example name.
+ if(name==='hub')mode.push('--announce',`/dns/relay.example.org/tcp/${port}/tls/ws`);
+ const family=process.env.P2P_IP6==='1'?['--ip-family','6']:process.env.P2P_IP4==='1'?['--ip-family','4']:[];
  const p=spawn(legacy?join(process.cwd(),'messenger'):binary,['--data',join(dir,name),...mode,...family,'--port',String(port),'--direct-port','0',...extra],{env:{...process.env,SSL_CERT_FILE:join(dir,'cert.pem')}});children.push(p);p.stderr.on('data',b=>logs+=b);p.stdout.on('data',b=>logs+=b);
  const initial=await until(async()=>{if(p.exitCode!==null)throw Error(logs);if(legacy){const m=logs.match(/Peer ID: (\S+)/);return m?{state:{peer:m[1]}}:null}return control(name)});
  assert.equal(statSync(join(dir,name)).mode&0o777,0o700);
  if(!legacy)assert.equal(statSync(join(dir,name,'control.sock')).mode&0o777,0o600);
- return {p,name,status:initial.state,port,logs:()=>logs,async stop(){if(p.exitCode!==null)return;const done=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');await done}};
+ const node={p,name,status:initial.state,port,logs:()=>logs,async stop(){if(p.exitCode!==null)return;const done=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');await done}};
+ nodes.push(node);return node;
 }
 try{
  execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(dir,'tls.key'),'-out',join(dir,'cert.pem'),'-days','1','-subj','/CN=localhost','-addext','subjectAltName=DNS:localhost'],{stdio:'ignore'});
@@ -68,6 +75,6 @@ try{
  assert.equal(JSON.parse(readFileSync(join(dir,'carol','config.json'),'utf8')).peer_list,source);
  await control('carol',{op:'send',to:dave.status.peer,text:'Сообщение через список публичных пиров'});
  await until(async()=>(await control('dave')).state.messages.length===1);
- console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline recovery, persisted settings and dynamic peer-list discovery with relay delivery.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':'')+(process.env.P2P_IP6==='1'?' IPv6 transport confirmed.':''));
-}catch(e){for(const p of children){if(p.exitCode===null)p.kill('SIGTERM')}throw e}
+ console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline recovery, persisted settings, dynamic peer-list discovery, relay reservations and message delivery.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':'')+(process.env.P2P_IP6==='1'?' IPv6 transport confirmed.':''));
+}catch(e){for(const n of nodes){try{const s=(await control(n.name)).state;console.error(n.name,JSON.stringify({discovery:s.discovery,addresses:s.addresses,connections:s.connections}),n.logs().slice(-3000))}catch{console.error(n.name,n.logs().slice(-3000))}}for(const p of children){if(p.exitCode===null)p.kill('SIGTERM')}throw e}
 finally{if(registryServer)await new Promise(r=>registryServer.close(r));await Promise.all(children.filter(p=>p.exitCode===null).map(p=>new Promise(r=>{p.once('exit',r);p.kill('SIGTERM')})));rmSync(dir,{recursive:true,force:true})}
