@@ -1,4 +1,4 @@
-// P2P messenger: a single source file with a terminal interface.
+// P2P messenger: a single executable with a terminal interface.
 package main
 
 import (
@@ -1418,12 +1418,176 @@ type TerminalUI struct {
 	lastContacts                  string
 	state                         Snapshot
 	request                       func(ControlRequest) (ControlReply, error)
+	readClipboard                 func() (string, error)
+	writeClipboard                func(string) error
+	consoleSelection              func(bool) error
+	mouseEnabled                  bool
+}
+
+// Windows installs native system clipboard functions from clipboard_windows.go.
+// Other platforms keep terminal paste shortcuts and OSC 52 copying.
+var nativeClipboardRead func() (string, error)
+var nativeClipboardWrite func(string) error
+var nativeConsoleSelection func(bool) error
+
+func clipboardText(text string) string {
+	text = strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, text)
+}
+
+func (u *TerminalUI) copyText(text string) bool {
+	if text == "" {
+		u.notice.SetText("Нечего копировать")
+		return false
+	}
+	if u.writeClipboard != nil {
+		if err := u.writeClipboard(text); err != nil {
+			u.notice.SetText("[red]Не удалось скопировать: " + terminalText(err.Error()) + "[-]")
+			return false
+		}
+		u.notice.SetText("[green]Скопировано в системный буфер[-]")
+	} else {
+		fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(text)))
+		u.notice.SetText("Текст передан терминалу для копирования (OSC 52)")
+	}
+	return true
+}
+
+func (u *TerminalUI) pasteClipboard() {
+	if u.readClipboard == nil {
+		u.notice.SetText("Используйте вставку терминала: Ctrl+Shift+V / Shift+Insert")
+		return
+	}
+	text, err := u.readClipboard()
+	if err != nil {
+		u.notice.SetText("[red]Не удалось вставить: " + terminalText(err.Error()) + "[-]")
+		return
+	}
+	text = clipboardText(text)
+	if text == "" {
+		u.notice.SetText("В буфере нет текста")
+		return
+	}
+	if len(text) > 16000 {
+		u.notice.SetText("[red]В буфере больше 16 000 байт; вставка отменена[-]")
+		return
+	}
+	setFocus := func(p tview.Primitive) { u.app.SetFocus(p) }
+	if u.recipient.HasFocus() {
+		text = strings.TrimSpace(text)
+		if strings.ContainsAny(text, "\n\t") {
+			u.notice.SetText("[red]В поле «Кому» нужен один Peer ID[-]")
+			return
+		}
+		u.recipient.PasteHandler()(text, setFocus)
+	} else {
+		_, start, end := u.compose.GetSelection()
+		if len(u.compose.GetText())-(end-start)+len(text) > 16000 {
+			u.notice.SetText("[red]Сообщение после вставки превышает 16 000 байт[-]")
+			return
+		}
+		u.pages.RemovePage("copy")
+		u.pages.HidePage("info")
+		u.app.SetFocus(u.compose)
+		u.compose.PasteHandler()(text, setFocus)
+	}
+	u.notice.SetText("[green]Вставлено. Enter: отправить; Alt+Enter: новая строка[-]")
+}
+
+func (u *TerminalUI) showCopyPicker() {
+	type item struct{ label, text string }
+	items := []item{{"Ваш Peer ID", u.state.Peer}}
+	if u.active != "" {
+		items = append(items, item{"Peer ID собеседника", u.active})
+	}
+	for _, entry := range u.state.Messages {
+		b := entry.Message.Body
+		if u.active == "" || b.From != u.active && b.To != u.active {
+			continue
+		}
+		label := clipboardText(b.Text)
+		label = strings.ReplaceAll(strings.ReplaceAll(label, "\n", " ↵ "), "\t", " ")
+		runes := []rune(label)
+		if len(runes) > 100 {
+			label = string(runes[:100]) + "…"
+		}
+		name := "Собеседник"
+		if b.From == u.state.Peer {
+			name = "Вы"
+		}
+		items = append(items, item{time.UnixMilli(b.Time).Local().Format("15:04") + " · " + name + " · " + label, b.Text})
+	}
+	list := tview.NewList().ShowSecondaryText(false).SetUseStyleTags(false, false)
+	list.SetBorder(true).SetTitle(" Копировать · ↑/↓ и Enter · Esc: назад ")
+	for _, it := range items {
+		list.AddItem(it.label, "", 0, nil)
+	}
+	closePicker := func() { u.pages.RemovePage("copy"); u.app.SetFocus(u.compose) }
+	list.SetDoneFunc(closePicker)
+	list.SetSelectedFunc(func(i int, _, _ string, _ rune) {
+		if i >= 0 && i < len(items) {
+			u.copyText(items[i].text)
+			closePicker()
+		}
+	})
+	u.pages.AddPage("copy", list, true, true)
+	u.app.SetFocus(list)
+}
+
+func (u *TerminalUI) copyFocusedText(cut bool) {
+	page, p := u.pages.GetFrontPage()
+	if page == "copy" {
+		p.InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(p tview.Primitive) { u.app.SetFocus(p) })
+		return
+	}
+	if u.recipient.HasFocus() {
+		if u.copyText(u.recipient.GetText()) && cut {
+			u.recipient.SetText("")
+		}
+		return
+	}
+	if u.compose.HasFocus() {
+		text, _, _ := u.compose.GetSelection()
+		if text == "" && !cut {
+			text = u.compose.GetText()
+		}
+		if u.copyText(text) && cut {
+			u.compose.PasteHandler()("", func(p tview.Primitive) { u.app.SetFocus(p) })
+		}
+		return
+	}
+	if page == "info" {
+		u.copyText(u.info.GetText(true))
+		return
+	}
+	u.showCopyPicker()
+}
+
+func (u *TerminalUI) toggleMouse() {
+	u.mouseEnabled = !u.mouseEnabled
+	u.app.EnableMouse(u.mouseEnabled)
+	if u.consoleSelection != nil {
+		if err := u.consoleSelection(!u.mouseEnabled); err != nil {
+			u.notice.SetText("[yellow]Режим мыши переключён: " + terminalText(err.Error()) + "[-]")
+			return
+		}
+	}
+	if u.mouseEnabled {
+		u.notice.SetText("Мышь управляет TUI. F5: копирование сообщений; F7: выделение терминала")
+	} else {
+		u.notice.SetText("Выделение терминала включено. Выделите мышью и скопируйте; Esc снимает выделение, F7 возвращает мышь TUI")
+	}
 }
 
 func newTerminalUI(call func(ControlRequest) (ControlReply, error)) *TerminalUI {
-	u := &TerminalUI{app: tview.NewApplication(), request: call}
+	u := &TerminalUI{app: tview.NewApplication(), request: call, readClipboard: nativeClipboardRead, writeClipboard: nativeClipboardWrite, consoleSelection: nativeConsoleSelection, mouseEnabled: true}
 	u.header = tview.NewTextView().SetDynamicColors(true)
-	u.notice = tview.NewTextView().SetDynamicColors(true).SetText("Tab: перейти • Enter: отправить • Alt+Enter: новая строка • F2: сеть • F3: копировать ID • Ctrl+Q: выход")
+	u.notice = tview.NewTextView().SetDynamicColors(true).SetText("Ctrl+C: копировать • F4: вставить • F5: сообщения • F3: свой ID • F7: мышь • F2: сеть • Ctrl+Q: выход")
 	u.history = tview.NewTextView().SetDynamicColors(true).SetScrollable(true).SetWordWrap(true)
 	u.history.SetBorder(true).SetTitle(" Беседа ")
 	u.info = tview.NewTextView().SetDynamicColors(true).SetScrollable(true).SetWordWrap(true)
@@ -1432,7 +1596,7 @@ func newTerminalUI(call func(ControlRequest) (ControlReply, error)) *TerminalUI 
 	u.contacts.SetBorder(true).SetTitle(" Беседы ")
 	u.recipient = tview.NewInputField().SetLabel("Кому: ").SetPlaceholder("Вставьте Peer ID и нажмите Enter")
 	u.compose = tview.NewTextArea().SetPlaceholder("Сообщение…").SetMaxLength(16000)
-	u.compose.SetBorder(true).SetTitle(" Сообщение ")
+	u.compose.SetBorder(true).SetTitle(" Сообщение · Enter: отправить · Alt+Enter: новая строка ")
 	u.send = tview.NewButton("Отправить").SetSelectedFunc(u.sendMessage)
 	u.contacts.SetSelectedFunc(func(i int, _, _ string, _ rune) {
 		if i < len(u.peers) {
@@ -1461,16 +1625,55 @@ func newTerminalUI(call func(ControlRequest) (ControlReply, error)) *TerminalUI 
 	u.pages = tview.NewPages().AddPage("chat", u.root, true, true).AddPage("info", u.info, true, false)
 	focus := []tview.Primitive{u.recipient, u.contacts, u.history, u.compose, u.send}
 	u.app.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+		if e.Key() == tcell.KeyInsert && e.Modifiers()&tcell.ModCtrl != 0 {
+			u.copyFocusedText(false)
+			return nil
+		}
+		if e.Key() == tcell.KeyInsert && e.Modifiers()&tcell.ModShift != 0 && u.readClipboard != nil {
+			u.pasteClipboard()
+			return nil
+		}
 		switch e.Key() {
-		case tcell.KeyCtrlC, tcell.KeyCtrlQ:
+		case tcell.KeyCtrlQ:
 			u.app.Stop()
 			return nil
+		case tcell.KeyCtrlC:
+			u.copyFocusedText(false)
+			return nil
+		case tcell.KeyCtrlX:
+			if u.readClipboard != nil && (u.compose.HasFocus() || u.recipient.HasFocus()) {
+				u.copyFocusedText(true)
+				return nil
+			}
+		case tcell.KeyCtrlV:
+			if u.readClipboard != nil {
+				u.pasteClipboard()
+				return nil
+			}
+		case tcell.KeyCtrlA:
+			if u.compose.HasFocus() {
+				u.compose.Select(0, len(u.compose.GetText()))
+				return nil
+			}
+			if u.recipient.HasFocus() {
+				u.recipient.InputHandler()(tcell.NewEventKey(tcell.KeyCtrlL, 0, tcell.ModNone), func(p tview.Primitive) { u.app.SetFocus(p) })
+				return nil
+			}
 		case tcell.KeyF3:
-			// OSC 52 lets supporting local terminals and SSH sessions copy an ID.
-			fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", base64.StdEncoding.EncodeToString([]byte(u.state.Peer)))
-			u.notice.SetText("Peer ID передан терминалу для копирования; полный ID доступен по F2")
+			u.copyText(u.state.Peer)
+			return nil
+		case tcell.KeyF4:
+			u.pasteClipboard()
+			return nil
+		case tcell.KeyF5:
+			u.showCopyPicker()
+			return nil
+		case tcell.KeyF7:
+			u.toggleMouse()
 			return nil
 		case tcell.KeyF2:
+			u.pages.RemovePage("copy")
+			u.app.SetFocus(u.compose)
 			if u.pages.HasFocus() && u.pages.GetPageCount() > 0 {
 				name, _ := u.pages.GetFrontPage()
 				if name == "info" {
@@ -1483,6 +1686,7 @@ func newTerminalUI(call func(ControlRequest) (ControlReply, error)) *TerminalUI 
 			}
 			return nil
 		case tcell.KeyEscape:
+			u.pages.RemovePage("copy")
 			u.pages.HidePage("info")
 			u.app.SetFocus(u.compose)
 			return nil
@@ -1491,7 +1695,7 @@ func newTerminalUI(call func(ControlRequest) (ControlReply, error)) *TerminalUI 
 			return nil
 		case tcell.KeyTab, tcell.KeyBacktab:
 			name, _ := u.pages.GetFrontPage()
-			if name == "info" {
+			if name == "info" || name == "copy" {
 				return nil
 			}
 			for i, p := range focus {

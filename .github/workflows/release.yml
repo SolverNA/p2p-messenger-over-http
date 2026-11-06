@@ -5,6 +5,8 @@ on:
 permissions:
   contents: read
 jobs:
+  windows-clipboard:
+    uses: ./.github/workflows/windows-clipboard.yml
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 25

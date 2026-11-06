@@ -1,0 +1,22 @@
+name: Windows clipboard
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '0'
+      GOTELEMETRY: 'off'
+      P2P_TEST_WINDOWS_CLIPBOARD: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -v -count=1 -run 'TestWindowsClipboardRoundTrip|TestTerminalSystemClipboard|TestTerminalClipboardErrorsAndMouseToggle' ./...
