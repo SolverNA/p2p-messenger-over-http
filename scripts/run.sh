@@ -42,7 +42,7 @@ chmod 700 "$work/$asset"
 # A curl | sh pipeline consumes stdin. Reopen the real terminal for the TUI.
 needs_tty=1
 for arg do
-    case "$arg" in --help|-help|-h|--headless|--status|--send) needs_tty=0;; esac
+    case "$arg" in --help|-help|-h|--headless|--status|--send|--check-peers) needs_tty=0;; esac
 done
 if [ ! -t 0 ] && [ "$needs_tty" -eq 1 ]; then
     [ -r /dev/tty ] || fail 'Open an interactive terminal to run the messenger.'

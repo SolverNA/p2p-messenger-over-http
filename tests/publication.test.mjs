@@ -117,8 +117,8 @@ printf '%s/%s fixture build' "$GOOS" "$GOARCH" > "$out"
   assert.notEqual(dirty.status,0); assert.match(dirty.stderr,/clean Git working tree/);
 });
 
-function launcher(t, os='Linux', arch='x86_64', corrupt=false) {
-  const dir=fixture(t), capture=join(dir,'captured'), args=['--help','value with spaces','$(never executed)'];
+function launcher(t, os='Linux', arch='x86_64', corrupt=false, args=['--help','value with spaces','$(never executed)']) {
+  const dir=fixture(t), capture=join(dir,'captured');
   const payload='#!/bin/sh\nprintf \'%s\\n\' "$@" > "$P2P_CAPTURE"\n';
   put(dir,'asset',payload);
   const platform=os==='Darwin'?'darwin':'linux', cpu=arch==='arm64'?'arm64':'amd64';
@@ -162,4 +162,10 @@ test('launcher rejects corrupted download and unsupported systems before executi
   assert.deepEqual(readdirSync(join(dir,'cache/p2pmessenger')),[]);
   const unknown=launcher(t,'Unknown','x86_64');
   assert.notEqual(unknown.r.status,0); assert.match(unknown.r.stderr,/Unsupported OS/);
+});
+
+test('peer-list validation through the launcher works without a terminal',t=>{
+  const {r,capture}=launcher(t,'Linux','x86_64',false,['--check-peers','peer list.txt']);
+  assert.equal(r.status,0,r.stderr);
+  assert.deepEqual(readFileSync(capture,'utf8').trim().split('\n'),['--check-peers','peer list.txt']);
 });
