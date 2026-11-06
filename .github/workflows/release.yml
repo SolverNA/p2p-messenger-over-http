@@ -1,0 +1,40 @@
+name: Build draft release
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      GOTELEMETRY: 'off'
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - run: node scripts/audit-publication.mjs --history
+      - run: node --test tests/publication.test.mjs
+      - run: node docs/check-architecture.mjs
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: CGO_ENABLED=0 go build -trimpath -buildvcs=false -o messenger-tui .
+      - run: node tests/smoke.mjs
+      - run: P2P_IP6=1 node tests/smoke.mjs
+      - run: node scripts/build-release.mjs "$RELEASE_TAG"
+      - name: Create draft with binaries, source, launchers and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --draft --title "P2P Messenger $RELEASE_TAG" --notes-file docs/release-notes.md

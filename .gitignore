@@ -9,3 +9,20 @@
 /messenger-*
 *.sock
 /node.log
+
+# Release artifacts and local runtime data never belong in the source tree.
+/dist/
+*.exe
+*.uu
+**/identity.key
+**/state.json
+**/config.json
+**/sequence.json
+**/node.lock
+**/node.log
+**/control.sock
+**/.write-*
+.env
+.env.*
+.DS_Store
+Thumbs.db
