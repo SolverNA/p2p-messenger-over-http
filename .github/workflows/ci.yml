@@ -25,6 +25,7 @@ jobs:
       - run: node scripts/audit-publication.mjs --history
       - run: node --test tests/publication.test.mjs
       - run: node docs/check-architecture.mjs
+      - run: go run . --check-peers public-peers.txt
       - run: go vet ./...
       - run: go test -race ./...
       - run: CGO_ENABLED=0 go build -trimpath -buildvcs=false -o messenger-tui .

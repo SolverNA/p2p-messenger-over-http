@@ -55,6 +55,22 @@ test('publication guard catches old personal data after the last tree is cleaned
   assert.match(r.stderr,/non-example IPv4/); assert(!r.stderr.includes(address));
 });
 
+test('intentional endpoint disclosure is allowed only in public-peers.txt, including identical history blobs',t=>{
+  const dir=repo(t), id='12D3'+'KooW'+'A'.repeat(44);
+  const entry='/ip4/'+[1,1,1,1].join('.')+'/tcp/80/ws/p2p/'+id+'\n';
+  put(dir,'public-peers.txt',entry);
+  git(dir,'add','.');git(dir,'commit','-qm','Community registry fixture');
+  assert.equal(scan(dir,'--history').status,0);
+  put(dir,'README.md',entry);
+  git(dir,'add','.');git(dir,'commit','-qm','Accidental disclosure fixture');
+  put(dir,'README.md','Clean latest tree');
+  git(dir,'add','.');git(dir,'commit','-qm','Remove disclosure fixture');
+  const r=scan(dir,'--history');assert.equal(r.status,1);assert.match(r.stderr,/README.md/);
+  const token='github'+'_pat_'+'b'.repeat(30);
+  put(dir,'public-peers.txt',entry+'# '+token+'\n');
+  assert.match(scan(dir).stderr,/private key \/ token/);
+});
+
 test('publication guard reports secrets; private author metadata checks are optional',t=>{
   const dir=repo(t), token='github'+'_pat_'+'a'.repeat(30);
   put(dir,'credentials.txt',token);

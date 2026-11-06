@@ -14,11 +14,11 @@ class Element{
 const elements=new Map();const document={getElementById(id){if(!elements.has(id))elements.set(id,new Element());return elements.get(id)},createElement(){return new Element()},querySelectorAll(){return []}};
 const context=vm.createContext({document,console,Blob,URL:{createObjectURL(){return 'blob:test'},revokeObjectURL(){}},setTimeout(fn){fn()}});
 new vm.Script(code).runInContext(context);
-assert.equal(elements.get('nav').children.length,9);
-for(let i=0;i<9;i++){
+assert.equal(elements.get('nav').children.length,10);
+for(let i=0;i<10;i++){
  elements.get('nav').children[i].onclick();
  assert.match(elements.get('canvas').innerHTML,/<svg/);
- assert(elements.get('title').textContent.startsWith('0'+(i+1)));
+ assert(elements.get('title').textContent.startsWith(String(i+1).padStart(2,'0')));
  assert.equal(elements.get('detail').children.length,3);
  assert(elements.get('detail').children[1].textContent.length>40);
  assert(elements.get('notes').children[0].children.length>0);
@@ -28,4 +28,4 @@ for(let i=0;i<9;i++){
 }
 assert(!/<script[^>]+src=|<link[^>]+href=/.test(html),'page must be standalone');
 const svg=readFileSync(new URL('architecture-overview.svg',import.meta.url),'utf8');assert(svg.startsWith('<svg'));assert(svg.endsWith('</svg>'));
-console.log('PASS: 9 navigation views, details, zoom controls, SVG export, standalone assets and JavaScript syntax.');
+console.log('PASS: 10 navigation views, details, zoom controls, SVG export, standalone assets and JavaScript syntax.');

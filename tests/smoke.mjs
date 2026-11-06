@@ -5,9 +5,11 @@ import {mkdtempSync,readFileSync,rmSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import net from 'node:net';
+import http from 'node:http';
 import assert from 'node:assert/strict';
 const dir=mkdtempSync(join(tmpdir(),'p2pmessenger-')),binary=join(process.cwd(),'messenger-tui');
 const children=[];
+let registryServer;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 // Stay outside Linux's usual ephemeral client-port range: an outbound libp2p
 // connection could otherwise claim a just-probed port before the child binds.
@@ -18,7 +20,7 @@ function control(name,q={op:'snapshot'}){return new Promise((resolve,reject)=>{c
 async function launch(name,extra=[]){
  const port=await freePort();let logs='';
  const legacy=name==='hub'&&process.env.P2P_LEGACY_HUB==='1';
- const mode=legacy?['--ui',`127.0.0.1:${await freePort()}`]:['--headless'];
+ const mode=legacy?['--ui',`127.0.0.1:${await freePort()}`]:['--headless',...(name==='hub'?['--peer-list','off']:[])];
  const family=process.env.P2P_IP6==='1'?['--ip-family','6']:[];
  const p=spawn(legacy?join(process.cwd(),'messenger'):binary,['--data',join(dir,name),...mode,...family,'--port',String(port),'--direct-port','0',...extra],{env:{...process.env,SSL_CERT_FILE:join(dir,'cert.pem')}});children.push(p);p.stderr.on('data',b=>logs+=b);p.stdout.on('data',b=>logs+=b);
  const initial=await until(async()=>{if(p.exitCode!==null)throw Error(logs);if(legacy){const m=logs.match(/Peer ID: (\S+)/);return m?{state:{peer:m[1]}}:null}return control(name)});
@@ -52,6 +54,20 @@ try{
  b=await launch('bob');assert.equal(b.status.peer,peer);assert.notEqual(b.port,oldPort);
  await until(async()=>(await control('alice')).state.messages.filter(e=>e.status==='delivered').length===2,60000);
  assert.equal((await control('bob')).state.messages.length,2);
- console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline status/retry, persisted config/keys/outbox, recovery on new address.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':'')+(process.env.P2P_IP6==='1'?' IPv6 transport confirmed.':''));
+ registryServer=http.createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/plain'});res.end(bootstrap+'\n')});
+ await new Promise(r=>registryServer.listen(0,'127.0.0.1',r));
+ const source=`http://127.0.0.1:${registryServer.address().port}/peers.txt`;
+ const carol=await launch('carol',['--reachability','private','--peer-list',source]);
+ const dave=await launch('dave',['--reachability','private','--peer-list',source]);
+ await until(async()=>{
+  const c=(await control('carol')).state,d=(await control('dave')).state;
+  return c.discovery.selected.length===1&&d.discovery.selected.length===1&&c.addresses.some(a=>a.includes('/p2p-circuit'))&&d.addresses.some(a=>a.includes('/p2p-circuit'));
+ },45000);
+ const cache=JSON.parse(readFileSync(join(dir,'carol','peer-list-cache.json'),'utf8'));
+ assert.equal(cache.source,source);assert.equal(Buffer.from(cache.text,'base64').toString(),bootstrap+'\n');
+ assert.equal(JSON.parse(readFileSync(join(dir,'carol','config.json'),'utf8')).peer_list,source);
+ await control('carol',{op:'send',to:dave.status.peer,text:'Сообщение через список публичных пиров'});
+ await until(async()=>(await control('dave')).state.messages.length===1);
+ console.log('PASS: WSS bootstrap, CLI status/send, private control socket, offline recovery, persisted settings and dynamic peer-list discovery with relay delivery.'+(process.env.P2P_LEGACY_HUB==='1'?' Legacy web hub compatible.':'')+(process.env.P2P_IP6==='1'?' IPv6 transport confirmed.':''));
 }catch(e){for(const p of children){if(p.exitCode===null)p.kill('SIGTERM')}throw e}
-finally{await Promise.all(children.filter(p=>p.exitCode===null).map(p=>new Promise(r=>{p.once('exit',r);p.kill('SIGTERM')})));rmSync(dir,{recursive:true,force:true})}
+finally{if(registryServer)await new Promise(r=>registryServer.close(r));await Promise.all(children.filter(p=>p.exitCode===null).map(p=>new Promise(r=>{p.once('exit',r);p.kill('SIGTERM')})));rmSync(dir,{recursive:true,force:true})}

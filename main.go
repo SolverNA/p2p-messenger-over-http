@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -15,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -43,6 +45,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/rivo/tview"
 	"golang.org/x/term"
 )
@@ -52,6 +55,8 @@ const (
 	messageProtocol   protocol.ID = "/p2pmessenger/message/1.0.0"
 	maxFrame                      = 128 << 10
 	maxHistory                    = 10000
+	defaultPeerList               = "https://raw.githubusercontent.com/SolverNA/p2p-messenger-over-http/main/public-peers.txt"
+	maxPublicPeers                = 128
 )
 
 type RouteBody struct {
@@ -102,18 +107,20 @@ type Ack struct {
 	Error string `json:"error,omitempty"`
 }
 type Node struct {
-	h        host.Host
-	key      crypto.PrivKey
-	dir      string
-	boots    []peer.AddrInfo
-	mu       sync.Mutex
-	state    DiskState
-	routes   map[peer.ID]Route
-	delivery map[string]PeerDelivery
-	reach    network.Reachability
-	wake     chan struct{}
-	sendWake chan struct{}
-	sem      chan struct{}
+	h          host.Host
+	key        crypto.PrivKey
+	dir        string
+	boots      []peer.AddrInfo
+	discovered []peer.AddrInfo
+	discovery  DiscoveryStatus
+	mu         sync.Mutex
+	state      DiskState
+	routes     map[peer.ID]Route
+	delivery   map[string]PeerDelivery
+	reach      network.Reachability
+	wake       chan struct{}
+	sendWake   chan struct{}
+	sem        chan struct{}
 }
 
 func bytesOf(v any) []byte { b, _ := json.Marshal(v); return b }
@@ -287,7 +294,7 @@ func (n *Node) cached(id peer.ID) *Route {
 func (n *Node) candidates(exclude peer.ID) []peer.ID {
 	seen := map[peer.ID]bool{n.h.ID(): true, exclude: true}
 	var out []peer.ID
-	for _, b := range n.boots {
+	for _, b := range n.bootstrapPeers() {
 		if !seen[b.ID] {
 			out = append(out, b.ID)
 			seen[b.ID] = true
@@ -303,6 +310,376 @@ func (n *Node) candidates(exclude peer.ID) []peer.ID {
 		}
 	}
 	return out
+}
+
+// Manual bootstrap peers stay pinned. Discovery only supplies additional peers.
+func (n *Node) bootstrapPeers() []peer.AddrInfo {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := append([]peer.AddrInfo{}, n.boots...)
+	seen := map[peer.ID]bool{}
+	for _, p := range out {
+		seen[p.ID] = true
+	}
+	for _, p := range n.discovered {
+		if !seen[p.ID] && len(out) < 16 {
+			out = append(out, p)
+			seen[p.ID] = true
+		}
+	}
+	return out
+}
+
+type DiscoveryPeer struct {
+	Peer      string  `json:"peer"`
+	RTTMillis float64 `json:"rtt_ms"`
+}
+type DiscoveryStatus struct {
+	Source     string          `json:"source,omitempty"`
+	Candidates int             `json:"candidates"`
+	Selected   []DiscoveryPeer `json:"selected"`
+	Updated    int64           `json:"updated,omitempty"`
+	Cached     bool            `json:"cached"`
+	Error      string          `json:"error,omitempty"`
+}
+
+// One WS/WSS multiaddress per line. Multiple addresses for one key are merged.
+func parsePeerList(raw []byte, publicOnly bool) ([]peer.AddrInfo, error) {
+	if len(raw) > 64<<10 {
+		return nil, errors.New("peer list exceeds 64 KiB")
+	}
+	byID := map[peer.ID]int{}
+	var out []peer.AddrInfo
+	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
+	scanner.Buffer(make([]byte, 2048), 4096)
+	line := 0
+	for scanner.Scan() {
+		line++
+		s := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
+		if s == "" {
+			continue
+		}
+		a, err := ma.NewMultiaddr(s)
+		if err != nil {
+			return nil, fmt.Errorf("peer list line %d: invalid multiaddress", line)
+		}
+		ai, err := peer.AddrInfoFromP2pAddr(a)
+		if err != nil || len(ai.Addrs) != 1 {
+			return nil, fmt.Errorf("peer list line %d: expected address ending in /p2p/PEER_ID", line)
+		}
+		ps := ai.Addrs[0].Protocols()
+		validHost := len(ps) > 0 && (ps[0].Code == ma.P_IP4 || ps[0].Code == ma.P_IP6 || ps[0].Code == ma.P_DNS || ps[0].Code == ma.P_DNS4 || ps[0].Code == ma.P_DNS6)
+		validTransport := (len(ps) == 3 && ps[1].Code == ma.P_TCP && (ps[2].Code == ma.P_WS || ps[2].Code == ma.P_WSS)) || (len(ps) == 4 && ps[1].Code == ma.P_TCP && ps[2].Code == ma.P_TLS && ps[3].Code == ma.P_WS)
+		port, _ := ai.Addrs[0].ValueForProtocol(ma.P_TCP)
+		if !validHost || !validTransport || port == "0" {
+			return nil, fmt.Errorf("peer list line %d: expected direct WS/WSS address with nonzero port", line)
+		}
+		if publicOnly && !manet.IsPublicAddr(ai.Addrs[0]) {
+			return nil, fmt.Errorf("peer list line %d: address must be publicly routable", line)
+		}
+		if index, ok := byID[ai.ID]; ok {
+			duplicate := false
+			for _, existing := range out[index].Addrs {
+				if existing.Equal(ai.Addrs[0]) {
+					duplicate = true
+				}
+			}
+			if !duplicate {
+				if len(out[index].Addrs) == 8 {
+					return nil, fmt.Errorf("peer list line %d: at most 8 addresses per peer", line)
+				}
+				out[index].Addrs = append(out[index].Addrs, ai.Addrs[0])
+			}
+		} else {
+			if len(out) == maxPublicPeers {
+				return nil, errors.New("peer list exceeds 128 peers")
+			}
+			byID[ai.ID] = len(out)
+			out = append(out, *ai)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("peer list: %w", err)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID.String() < out[j].ID.String() })
+	return out, nil
+}
+
+func peerListSource(c Config) string {
+	if c.PeerList == "off" {
+		return ""
+	}
+	if c.PeerList == "" || c.PeerList == "auto" {
+		if strings.TrimSpace(c.Bootstrap) != "" {
+			return ""
+		}
+		return defaultPeerList
+	}
+	return c.PeerList
+}
+
+func readPeerList(ctx context.Context, source string) ([]byte, error) {
+	var reader io.ReadCloser
+	if strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://") {
+		checkURL := func(u *url.URL) error {
+			ip := net.ParseIP(u.Hostname())
+			if u.User != nil || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || ip != nil && ip.IsLoopback()))) {
+				return errors.New("peer list URL must use HTTPS (HTTP is allowed only on loopback)")
+			}
+			return nil
+		}
+		u, err := url.Parse(source)
+		if err != nil {
+			return nil, err
+		}
+		if err = checkURL(u); err != nil {
+			return nil, err
+		}
+		client := &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many peer list redirects")
+			}
+			return checkURL(req.URL)
+		}}
+		req, err := http.NewRequestWithContext(ctx, "GET", source, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("peer list HTTP status %d", resp.StatusCode)
+		}
+		reader = resp.Body
+	} else {
+		f, err := os.Open(source)
+		if err != nil {
+			return nil, err
+		}
+		reader = f
+	}
+	defer reader.Close()
+	raw, err := io.ReadAll(io.LimitReader(reader, (64<<10)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 64<<10 {
+		return nil, errors.New("peer list exceeds 64 KiB")
+	}
+	return raw, nil
+}
+
+type measuredPeer struct {
+	Info peer.AddrInfo
+	RTT  time.Duration
+}
+
+func choosePublicPeers(measured []measuredPeer, public bool) []measuredPeer {
+	sort.Slice(measured, func(i, j int) bool {
+		if measured[i].RTT == measured[j].RTT {
+			return measured[i].Info.ID.String() < measured[j].Info.ID.String()
+		}
+		return measured[i].RTT < measured[j].RTT
+	})
+	if public && len(measured) > 3 {
+		// One common reachable anchor helps public nodes bridge latency regions.
+		anchor := 0
+		for i := range measured {
+			if measured[i].Info.ID.String() < measured[anchor].Info.ID.String() {
+				anchor = i
+			}
+		}
+		p := measured[anchor]
+		copy(measured[1:anchor+1], measured[:anchor])
+		measured[0] = p
+	}
+	return measured[:min(3, len(measured))]
+}
+
+// Probes use a temporary dial-only identity. Unselected candidates never become
+// connections of the real node and never receive its signed route from a probe.
+func probePublicPeers(ctx context.Context, peers []peer.AddrInfo) ([]measuredPeer, error) {
+	if len(peers) == 0 {
+		return nil, nil
+	}
+	h, err := libp2p.New(libp2p.NoListenAddrs, libp2p.NoTransports, libp2p.Transport(websocket.New), libp2p.Security(noise.ID, noise.New), libp2p.DisableRelay(), libp2p.UserAgent("p2pmessenger-probe/0.2"))
+	if err != nil {
+		return nil, err
+	}
+	defer h.Close()
+	var wg sync.WaitGroup
+	results := make(chan measuredPeer, len(peers))
+	sem := make(chan struct{}, 4)
+	for _, ai := range peers {
+		wg.Add(1)
+		go func(ai peer.AddrInfo) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			c, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if h.Connect(c, ai) != nil {
+				return
+			}
+			select {
+			case result, ok := <-ping.Ping(c, h, ai.ID):
+				if ok && result.Error == nil {
+					results <- measuredPeer{ai, result.RTT}
+				}
+			case <-c.Done():
+			}
+			h.Network().ClosePeer(ai.ID)
+		}(ai)
+	}
+	wg.Wait()
+	close(results)
+	var out []measuredPeer
+	for p := range results {
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (n *Node) selectRegistryPeers(ctx context.Context, peers []peer.AddrInfo, cursor *int) {
+	batch := map[peer.ID]peer.AddrInfo{}
+	n.mu.Lock()
+	for _, ai := range n.discovered {
+		for _, current := range peers {
+			if current.ID == ai.ID {
+				batch[ai.ID] = current
+			}
+		}
+	}
+	public := n.reach == network.ReachabilityPublic
+	n.mu.Unlock()
+	// Revisit common anchors and rotate a bounded sample through the full list.
+	for _, ai := range peers[:min(3, len(peers))] {
+		batch[ai.ID] = ai
+	}
+	for i := 0; i < min(8, len(peers)); i++ {
+		ai := peers[(*cursor+i)%len(peers)]
+		batch[ai.ID] = ai
+	}
+	if len(peers) > 0 {
+		*cursor = (*cursor + 8) % len(peers)
+	}
+	var candidates []peer.AddrInfo
+	for id, ai := range batch {
+		if id != n.h.ID() {
+			candidates = append(candidates, ai)
+		}
+	}
+	measured, err := probePublicPeers(ctx, candidates)
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		n.mu.Lock()
+		n.discovery.Error = err.Error()
+		n.mu.Unlock()
+		return
+	}
+	selected := choosePublicPeers(measured, public)
+	n.mu.Lock()
+	previous := n.discovered
+	n.discovered = nil
+	n.discovery.Selected = nil
+	for _, p := range selected {
+		n.discovered = append(n.discovered, p.Info)
+		n.discovery.Selected = append(n.discovery.Selected, DiscoveryPeer{p.Info.ID.String(), float64(p.RTT) / float64(time.Millisecond)})
+	}
+	n.mu.Unlock()
+	for _, old := range previous {
+		keep := false
+		for _, ai := range n.bootstrapPeers() {
+			if ai.ID == old.ID {
+				keep = true
+			}
+		}
+		// Keep existing relays and conversations; a registry is not a blocklist.
+		for _, a := range n.h.Addrs() {
+			if strings.Contains(a.String(), "/p2p/"+old.ID.String()+"/p2p-circuit") {
+				keep = true
+			}
+		}
+		for _, c := range n.h.Network().ConnsToPeer(old.ID) {
+			for _, s := range c.GetStreams() {
+				if s.Protocol() == messageProtocol {
+					keep = true
+				}
+			}
+		}
+		if !keep {
+			n.h.Network().ClosePeer(old.ID)
+		}
+	}
+	notify(n.wake)
+}
+
+func (n *Node) discover(ctx context.Context, source string) {
+	// Explicit custom lists may describe a private test network. The community
+	// registry must contain publicly routable addresses only, including in cache.
+	publicOnly := source == defaultPeerList
+	var cached struct {
+		Source string `json:"source"`
+		Text   []byte `json:"text"`
+	}
+	var peers []peer.AddrInfo
+	cache := filepath.Join(n.dir, "peer-list-cache.json")
+	if raw, err := os.ReadFile(cache); err == nil && json.Unmarshal(raw, &cached) == nil && cached.Source == source {
+		if list, err := parsePeerList(cached.Text, publicOnly); err == nil {
+			peers = list
+		}
+	}
+	n.mu.Lock()
+	n.discovery = DiscoveryStatus{Source: source, Candidates: len(peers), Cached: len(peers) > 0}
+	n.mu.Unlock()
+	refresh := time.Time{}
+	cursor := 0
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		if !time.Now().Before(refresh) {
+			raw, err := readPeerList(ctx, source)
+			var list []peer.AddrInfo
+			if err == nil {
+				list, err = parsePeerList(raw, publicOnly)
+			}
+			n.mu.Lock()
+			if err != nil {
+				n.discovery.Error = err.Error()
+				n.discovery.Cached = len(peers) > 0
+				refresh = time.Now().Add(30 * time.Second)
+			} else {
+				peers = list
+				n.discovery.Candidates = len(peers)
+				n.discovery.Updated = time.Now().UnixMilli()
+				n.discovery.Cached = false
+				n.discovery.Error = ""
+				refresh = time.Now().Add(5 * time.Minute)
+			}
+			n.mu.Unlock()
+			if err == nil {
+				cached.Source, cached.Text = source, raw
+				if err := atomicWrite(cache, bytesOf(cached)); err != nil {
+					log.Printf("peer list cache: %v", err)
+				}
+			}
+		}
+		n.selectRegistryPeers(ctx, peers, &cursor)
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 func (n *Node) rpc(ctx context.Context, id peer.ID, req Request) (Response, error) {
 	var res Response
@@ -710,7 +1087,7 @@ func (n *Node) maintain(ctx context.Context) {
 	defer publish.Stop()
 	connect := func() {
 		var wg sync.WaitGroup
-		for _, b := range n.boots {
+		for _, b := range n.bootstrapPeers() {
 			if len(n.h.Network().ConnsToPeer(b.ID)) > 0 {
 				continue
 			}
@@ -745,6 +1122,7 @@ func (n *Node) maintain(ctx context.Context) {
 				return
 			case <-timer.C:
 			}
+			connect()
 			n.publish(ctx)
 			notify(n.sendWake)
 		case <-heartbeat.C:
@@ -809,6 +1187,7 @@ type Snapshot struct {
 	Queued       int                     `json:"queued"`
 	Messages     []Entry                 `json:"messages"`
 	Peers        map[string]PeerDelivery `json:"peers"`
+	Discovery    DiscoveryStatus         `json:"discovery"`
 }
 type ControlRequest struct {
 	Op   string `json:"op"`
@@ -823,7 +1202,8 @@ type ControlReply struct {
 
 func (n *Node) snapshot() Snapshot {
 	n.mu.Lock()
-	s := Snapshot{Peer: n.h.ID().String(), Reachability: n.reach.String(), Messages: append([]Entry{}, n.state.Messages...), Peers: map[string]PeerDelivery{}}
+	s := Snapshot{Peer: n.h.ID().String(), Reachability: n.reach.String(), Messages: append([]Entry{}, n.state.Messages...), Peers: map[string]PeerDelivery{}, Discovery: n.discovery}
+	s.Discovery.Selected = append([]DiscoveryPeer{}, n.discovery.Selected...)
 	for id, d := range n.delivery {
 		// A successful past delivery is not proof that the peer is still online.
 		if d.Status != "connected" {
@@ -928,6 +1308,7 @@ type Config struct {
 	TLSCert      string `json:"tls_cert"`
 	TLSKey       string `json:"tls_key"`
 	IPFamily     string `json:"ip_family"`
+	PeerList     string `json:"peer_list"`
 }
 
 func listenAddresses(c Config, suffix string) ([]string, error) {
@@ -967,7 +1348,7 @@ func defaultData() string {
 	return filepath.Join(home, ".local", "share", "p2pmessenger")
 }
 func savedConfig(dir string, explicit Config, visited map[string]bool) (Config, error) {
-	cfg := Config{Port: 8081, DirectPort: 4002, Reachability: "auto", IPFamily: "auto"}
+	cfg := Config{Port: 8081, DirectPort: 4002, Reachability: "auto", IPFamily: "auto", PeerList: "auto"}
 	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err == nil {
 		if err = json.Unmarshal(raw, &cfg); err != nil {
@@ -994,6 +1375,8 @@ func savedConfig(dir string, explicit Config, visited map[string]bool) (Config, 
 			cfg.TLSKey = explicit.TLSKey
 		case "ip-family":
 			cfg.IPFamily = explicit.IPFamily
+		case "peer-list":
+			cfg.PeerList = explicit.PeerList
 		}
 	}
 	return cfg, nil
@@ -1242,6 +1625,22 @@ func (u *TerminalUI) update(s Snapshot) {
 		u.history.SetText(text).ScrollToEnd()
 	}
 	var info strings.Builder
+	if s.Discovery.Source != "" {
+		fmt.Fprintf(&info, "[green]Публичные узлы из списка[-]\n%s\nИзвестно: %d · выбрано: %d\n", terminalText(s.Discovery.Source), s.Discovery.Candidates, len(s.Discovery.Selected))
+		if s.Discovery.Cached {
+			info.WriteString("Используется сохранённая копия списка.\n")
+		}
+		if s.Discovery.Error != "" {
+			fmt.Fprintf(&info, "[yellow]%s[-]\n", terminalText(s.Discovery.Error))
+		}
+		if s.Discovery.Candidates == 0 {
+			info.WriteString("Список пуст или ещё не загружен; можно задать --bootstrap.\n")
+		}
+		for _, p := range s.Discovery.Selected {
+			fmt.Fprintf(&info, "%s · RTT %.1f мс\n", terminalText(p.Peer), p.RTTMillis)
+		}
+		info.WriteString("\n")
+	}
 	fmt.Fprintf(&info, "[green]Ваш Peer ID[-]\n%s\n\n[green]Адреса[-]\n%s\n\n[green]Соединения[-]\n", terminalText(s.Peer), terminalText(strings.Join(s.Addresses, "\n")))
 	for _, c := range s.Connections {
 		kind := "прямое"
@@ -1311,6 +1710,7 @@ func run() error {
 	status := flag.Bool("status", false, "print running node status and history as JSON")
 	send := flag.String("send", "", "queue a message to this Peer ID on a running node")
 	message := flag.String("message", "", "text for --send")
+	checkPeers := flag.String("check-peers", "", "validate a public peer list file and exit")
 	_ = flag.String("ui", "", "deprecated: browser UI removed; use --attach")
 	var cfg Config
 	flag.IntVar(&cfg.Port, "port", 8081, "WS/WSS port (use 80/443 on public nodes)")
@@ -1321,7 +1721,20 @@ func run() error {
 	flag.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM TLS certificate chain")
 	flag.StringVar(&cfg.TLSKey, "tls-key", "", "PEM TLS private key")
 	flag.StringVar(&cfg.IPFamily, "ip-family", "auto", "listener IP family: auto (IPv4 + IPv6), 4 or 6")
+	flag.StringVar(&cfg.PeerList, "peer-list", "auto", "public peer list: auto, off, HTTPS URL or local file; auto is disabled with manual --bootstrap")
 	flag.Parse()
+	if *checkPeers != "" {
+		raw, err := os.ReadFile(*checkPeers)
+		if err != nil {
+			return err
+		}
+		peers, err := parsePeerList(raw, true)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Valid public peer list: %d peers\n", len(peers))
+		return nil
+	}
 	if flag.NArg() > 0 {
 		return errors.New("unexpected positional arguments; use one line without backslashes, or put each backslash at the end of a line")
 	}
@@ -1456,7 +1869,7 @@ func run() error {
 	for i, opt := range wsopts {
 		wsargs[i] = opt
 	}
-	opts := []libp2p.Option{libp2p.Identity(identity), libp2p.NoTransports, libp2p.Transport(websocket.New, wsargs...), libp2p.Security(noise.ID, noise.New), libp2p.EnableRelay(), libp2p.EnableRelayService(), libp2p.EnableNATService(), libp2p.EnableHolePunching(), libp2p.NATPortMap(), libp2p.UserAgent("p2pmessenger/0.1")}
+	opts := []libp2p.Option{libp2p.Identity(identity), libp2p.NoTransports, libp2p.Transport(websocket.New, wsargs...), libp2p.Security(noise.ID, noise.New), libp2p.EnableRelay(), libp2p.EnableRelayService(), libp2p.EnableNATService(), libp2p.EnableHolePunching(), libp2p.NATPortMap(), libp2p.UserAgent("p2pmessenger/0.2")}
 	listens, e := listenAddresses(cfg, suffix)
 	if e != nil {
 		return e
@@ -1479,8 +1892,25 @@ func run() error {
 	default:
 		return errors.New("invalid --reachability")
 	}
-	if len(n.boots) > 0 {
-		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(n.boots, autorelay.WithNumRelays(min(3, len(n.boots))), autorelay.WithBootDelay(3*time.Second), autorelay.WithBackoff(15*time.Second)))
+	source := peerListSource(cfg)
+	if source != "" || len(n.boots) > 0 {
+		if source == "" {
+			opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(n.boots, autorelay.WithNumRelays(min(3, len(n.boots))), autorelay.WithBootDelay(3*time.Second), autorelay.WithBackoff(15*time.Second)))
+		} else {
+			opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(func(ctx context.Context, num int) <-chan peer.AddrInfo {
+				peers := n.bootstrapPeers()
+				out := make(chan peer.AddrInfo, min(num, len(peers)))
+				defer close(out)
+				for _, p := range peers[:min(num, len(peers))] {
+					select {
+					case out <- p:
+					case <-ctx.Done():
+						return out
+					}
+				}
+				return out
+			}, autorelay.WithNumRelays(3), autorelay.WithMinCandidates(1), autorelay.WithMaxCandidates(16), autorelay.WithMinInterval(5*time.Second), autorelay.WithBootDelay(3*time.Second), autorelay.WithBackoff(15*time.Second)))
+		}
 	}
 	n.h, err = libp2p.New(opts...)
 	if err != nil {
@@ -1516,13 +1946,20 @@ func run() error {
 	for _, a := range n.h.Addrs() {
 		log.Printf("address: %s/p2p/%s", a, n.h.ID())
 	}
-	if len(n.boots) == 0 {
+	if source != "" {
+		log.Printf("public peer list: %s", source)
+	}
+	if len(n.boots) == 0 && source == "" {
 		log.Print("No bootstrap: waiting for incoming peers. AutoNAT needs independent reachable peers to determine reachability.")
 	}
 	var workers sync.WaitGroup
 	workers.Add(2)
 	go func() { defer workers.Done(); n.maintain(ctx) }()
 	go func() { defer workers.Done(); n.sendLoop(ctx) }()
+	if source != "" {
+		workers.Add(1)
+		go func() { defer workers.Done(); n.discover(ctx, source) }()
+	}
 	if interactive {
 		err = terminalUI(ctx, func(q ControlRequest) (ControlReply, error) { return controlCall(*dir, q) })
 	} else {

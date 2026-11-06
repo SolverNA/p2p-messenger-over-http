@@ -1,0 +1,7 @@
+# Community bootstrap peers for P2P Messenger.
+# One public WS/WSS multiaddress per line, including /p2p/PEER_ID.
+# Multiple IPv4/IPv6/DNS addresses for the same Peer ID are allowed.
+# Add your running public node through a Pull Request. See CONTRIBUTING.md.
+# Example (replace the hostname and Peer ID; do not uncomment this placeholder):
+# /dns4/node.example.org/tcp/443/tls/ws/p2p/PUBLIC_PEER_ID
+# There are currently no community peers registered.
