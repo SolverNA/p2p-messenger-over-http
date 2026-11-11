@@ -10,7 +10,7 @@
 curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/SolverNA/p2p-messenger-over-http/main/scripts/run.sh | P2PMESSENGER_REPO=SolverNA/p2p-messenger-over-http sh -s -- --bootstrap /dns4/node.example.org/tcp/443/tls/ws/p2p/PEER_ID
 ```
 
-Без ручного `--bootstrap` версия v0.2.3 и новее получает общий список `public-peers.txt`; пока он пуст, нужен свой публичный узел. Настройки ручного bootstrap сохраняются. Вместо `main` используйте настоящий основной branch, если он называется иначе. Для воспроизводимого запуска замените `main` на проверенный тег в URL скрипта и добавьте `P2PMESSENGER_VERSION=v0.2.3` рядом с `P2PMESSENGER_REPO`.
+Без ручного `--bootstrap` версия v0.2.3 и новее получает общий список `public-peers.txt`. Настройки ручного bootstrap сохраняются. Вместо `main` используйте настоящий основной branch, если он называется иначе. Для воспроизводимого запуска замените `main` на проверенный тег в URL скрипта и добавьте `P2PMESSENGER_VERSION=v0.2.3` рядом с `P2PMESSENGER_REPO`.
 
 Скрипт определяет Linux/macOS и x86_64/arm64, скачивает бинарник и контрольные суммы по HTTPS, сверяет SHA-256, открывает TUI и удаляет временные файлы после выхода. Данные чата остаются в обычном профиле. Go и Node на компьютере пользователя не нужны; нужны `curl` и `sha256sum` либо `shasum` (обычно уже есть). При передаче скрипта через pipe ввод TUI открывается из `/dev/tty`.
 

@@ -4,4 +4,4 @@
 # Add your running public node through a Pull Request. See CONTRIBUTING.md.
 # Example (replace the hostname and Peer ID; do not uncomment this placeholder):
 # /dns4/node.example.org/tcp/443/tls/ws/p2p/PUBLIC_PEER_ID
-# There are currently no community peers registered.
+/ip4/217.60.245.23/tcp/80/ws/p2p/12D3KooWFxczDMErBhwnVTuPAEybqiZ4bBQXMzxoUPZKh3NJHzTc
